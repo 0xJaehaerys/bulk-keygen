@@ -290,14 +290,13 @@ export default function Home() {
     <LocalVersion/>
     <section className="card" aria-label="Agent key manager">
       <div className="setup stack">
-        <div className="wallet-guidance"><p><strong>Backpack recommended</strong></p><p className="hint">Create subaccounts and their API / agent keys. Phantom supports main-account agent keys only; those also cover all subaccounts.</p></div>
+        <div className="wallet-guidance"><p><strong>Backpack recommended</strong></p><p className="hint">Create subaccounts and their agent keys. Phantom supports main-account agent keys only.</p></div>
         <NetworkSwitcher value={network} onChange={changeNetwork} lockedReason={networkLockReason}/>
         {owner ? <div className="wallet-row"><div><span className="label" title="Previously approved sites may reconnect without a new approval prompt.">Connected · {walletName}</span><code title={owner}>{shortKey(owner)}</code></div><button className="btn text" aria-label="Change wallet" disabled={!!busy} onClick={chooseWallet}>Change</button></div> : <button className="btn primary full" onClick={chooseWallet} disabled={!!busy}><Wallet size={17}/> Connect wallet</button>}
         {accounts.length > 0 ? <div className="field"><label id="account-label" className="label">Account</label><Select value={account} onValueChange={v => v && selectAccount(v)} disabled={!!key || !!subaccountOwner || !!busy}><SelectTrigger className="account-select" aria-labelledby="account-label"><SelectValue>{account === owner ? 'Main account' : 'Subaccount'} · {shortKey(account)}</SelectValue></SelectTrigger><SelectContent>{accounts.map(a => <SelectItem key={a} value={a}>{a === owner ? 'Main account' : 'Subaccount'} · {shortKey(a)}</SelectItem>)}</SelectContent></Select></div> : key ? <div className="wallet-row"><span className="label">Account</span><code title={key.account}>{shortKey(key.account)}</code></div> : owner ? <button className="btn full" disabled={!!busy} onClick={() => void run('Loading accounts…', v => loadAccounts(network, owner, v))}>Load accounts</button> : <p className="hint">Connect the owner wallet to create or select a BULK subaccount.</p>}
         <SubaccountCreator network={network} owner={owner} hasKey={!!key} busy={!!busy} wallet={() => provider.current} run={run} ensureContext={ensureContext} onPendingChange={setSubaccountOwner} onVerified={(address, info) => { setAccounts(current => Array.from(new Set([...current, address]))); setAccount(address); setAccountInfo(info); setNotice('Subaccount selected. Create its agent key below.'); }}/>
         {accountInfo?.kind === 'MasterEOA' && <p className="hint account-note">Main account keys also cover all subaccounts.</p>}
         {phantomSubaccount && <output className="hint account-note">{PHANTOM_SUBACCOUNT_MESSAGE}</output>}
-        {isPhantomWallet(walletName) && account === owner && !!account && <p className="hint">Phantom can register main-account agent keys only. For subaccount-only access, use Backpack with the same owner address.</p>}
         {accountInfo?.kind === 'MasterEOA' && accountInfo.subAccounts === null && <p className="hint">BULK did not return a subaccount list. Showing your main account.</p>}
       </div>
       <div className="key-section stack">
@@ -333,7 +332,7 @@ export default function Home() {
         {busy && <div role="status" className="busy"><LoaderCircle size={16} className="spin"/>{stage === 'signing' ? `Confirm in ${walletName || 'your wallet'}…` : busy}</div>}
       </div>
     </section>
-    <footer>Early beta · Independent tool · not affiliated with BULK · <a href="https://github.com/0xJaehaerys/bulk-keygen" target="_blank" rel="noopener noreferrer">Source code</a></footer>
+    <footer><a href="https://github.com/0xJaehaerys/bulk-keygen" target="_blank" rel="noopener noreferrer">Source code</a> · Not affiliated with BULK</footer>
     <Dialog open={dialog === 'wallet' || dialog === 'wallet-account'} onOpenChange={open => { if (!open && !busyRef.current) closeDialog(); }}>
       <DialogContent className="vault-dialog">
         <DialogTitle>{dialog === 'wallet-account' ? 'Choose wallet account' : 'Connect wallet'}</DialogTitle>
@@ -341,7 +340,7 @@ export default function Home() {
         <div className="stack">
           {dialog === 'wallet-account' ? walletAccounts.map(connection => <button key={`${connection.id}:${connection.publicKey?.toString()}`} className="btn full" disabled={!!busy || !connection.publicKey} title={connection.publicKey?.toString()} onClick={() => { closeDialog(); void run('Loading BULK accounts…', () => activateConnection(connection)); }}><code>{connection.publicKey ? shortKey(connection.publicKey.toString()) : 'Unavailable'}</code></button>) : wallets.map(option => <button key={option.id} className="btn full wallet-option" aria-label={option.name} disabled={!!busy} onClick={() => connect(option)}><Wallet size={17}/> {option.name}{option.name.toLowerCase() === 'backpack' && <span className="recommendation">Recommended</span>}{option.name.toLowerCase() === 'phantom' && <span className="wallet-limit">Main account only</span>}</button>)}
           {dialog === 'wallet' && wallets.length === 0 && <><p className="hint">No compatible wallet found. Install or enable Backpack in this browser, then refresh the list.</p><button className="btn full" onClick={() => setWallets(availableWallets())}>Refresh wallets</button></>}
-          <a className="quiet-link" href="https://backpack.app/" target="_blank" rel="noreferrer">Get Backpack from its official website ↗</a><p className="hint">For an existing account, connect its exact owner address. Backpack desktop creation, backup restore and revocation are user-confirmed; other wallets and mobile combinations may differ. Email login and hardware-only accounts may not support message signing.</p>
+          <a className="quiet-link" href="https://backpack.app/" target="_blank" rel="noreferrer">Get Backpack from its official website ↗</a><p className="hint">Connect the owner of your BULK account. Mobile and hardware wallets may not support message signing. Email login is not supported.</p>
           <button className="btn text full" onClick={closeDialog}>Cancel</button>
         </div>
       </DialogContent>

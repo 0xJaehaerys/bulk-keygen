@@ -62,7 +62,7 @@ export function LocalVersion() {
           {!local && <a className="btn primary full" href="/downloads/bulk-keygen-local.zip" download="bulk-keygen-local.zip"><Download size={16}/> Download ZIP</a>}
           <p className="hint">START-HERE.html inside the ZIP repeats these steps offline. Keep START.mjs with the scripts and dist folders. The ZIP does not contain your keys or wallet session. Save an existing key before leaving its page. Generate a new key in the local copy, or restore your latest saved backup yourself.</p>
         </div>}
-        <div className="guide-wallets"><strong>Use Backpack for subaccounts.</strong><p className="hint">Subaccount creation and agent registration have been reported working on desktop. Phantom supports main-account agent keys only; those also cover all subaccounts. Connect the owner address of the intended BULK account.</p><a href="https://backpack.app/" target="_blank" rel="noreferrer">Get Backpack from its official website ↗</a></div>
+        <div className="guide-wallets"><strong>Use Backpack for subaccounts.</strong><p className="hint">Create subaccounts and their agent keys with Backpack on desktop. Phantom supports main-account agent keys only; those also cover all subaccounts. Connect the owner address of the intended BULK account.</p><a href="https://backpack.app/" target="_blank" rel="noreferrer">Get Backpack from its official website ↗</a></div>
         <details className="guide-details"><summary>Let an AI agent help with setup</summary><div className="stack guide-detail-body">
           <p className="hint">Copy these instructions into your agent chat. They contain setup guidance only, never your wallet or key data. The agent can explain the steps; you keep control of secrets and wallet approvals.</p>
           <button className="btn full" onClick={() => void copy(AGENT_SETUP_GUIDE, 'agent')}>{copied === 'agent' ? <Check size={16}/> : <Copy size={16}/>} {copied === 'agent' ? 'Instructions copied' : 'Copy instructions for an agent'}</button>
@@ -72,7 +72,7 @@ export function LocalVersion() {
         </div></details>
         <details className="guide-details"><summary><ShieldCheck size={16}/> What local use protects</summary><div className="stack guide-detail-body">
           <p className="hint">Your agent private key is generated and handled on your device. This app sends public account data and signed requests directly to BULK, not your private key. It has no analytics, automatic key storage or automatic code updates.</p>
-          <p className="hint">A saved copy avoids future changes to the hosted page. You still need to trust the initial download, bundled code, browser extensions and your computer. This is not a zero-risk guarantee or an independent security audit.</p>
+          <p className="hint">A saved copy avoids future changes to the hosted page. You still need to trust the initial download, bundled code, browser extensions and your computer.</p>
           <p className="hint">Plain JSON contains a usable private key. Store it privately, outside shared or synced folders. An encrypted backup protects the saved file; it cannot protect a key once unlocked by malicious software. Save the latest recovery file after signing. Clearing the page does not revoke access.</p>
           <p className="hint">Use a dedicated subaccount to limit scope. The browser setup needs account lookup; fully offline generation is available in the CLI described in README-LOCAL.md. Registering any key still needs BULK.</p>
         </div></details>
