@@ -322,3 +322,40 @@ test('a forged historical signature rejects the entire UI import before any conn
     assert.equal(a.network().lockedReason, ''); assert.equal(a.orders.length, 0); assert.equal(a.signed.length, 0); assert.equal(a.reads.length, 0);
   } finally { globalThis.fetch = original; }
 });
+
+
+test('encrypted backup is visible beside JSON and saves signed recovery without sending or acknowledging it', async () => {
+  const original = globalThis.fetch;
+  try {
+    const a = fresh({ walletName: 'Backpack' }); await a.connect(); await a.child(); await a.click('Create agent key');
+    const region = all(a.render()).find(n => n.type === 'section' && n.props['aria-label'] === 'Backups');
+    assert.ok(region); assert.match(text(region), /Save encrypted backup/); assert.match(text(region), /Unencrypted JSON/);
+    const more = all(a.render()).filter(n => n.type === 'CollapsibleContent');
+    assert.ok(more.every(n => !text(n).includes('Save encrypted backup')), 'encrypted backup must be outside collapsed options');
+    const password = 'disposable-backup-test-password-2026';
+    async function saveEncrypted() {
+      await a.click('Save encrypted backup');
+      const fields = all(a.render()).filter(n => n.type === 'Input' && n.props.type === 'password');
+      assert.equal(fields.length, 2);
+      for (const field of fields) field.props.onChange({ target: { value: password } });
+      all(a.render()).find(n => n.type === 'form' && all(n).some(x => x.type === 'Input' && x.props.type === 'password')).props.onSubmit({ preventDefault() {} });
+      await a.settle();
+      const data = await a.downloads.at(-1).text();
+      assert.equal(JSON.parse(data).format, 'bulk-agent-vault-v1');
+      assert.doesNotMatch(data, /agent_private_key_base58|bulk-agent-backup-v2/);
+      return vault.decryptVault(data, password);
+    }
+    const keyBackup = await saveEncrypted();
+    assert.equal(keyBackup.submission, null);
+    assert.equal(a.button('Sign registration').props.disabled, true, 'download is not saved acknowledgement');
+    a.check('I saved my key'); await a.click('Sign registration');
+    const readsBefore = a.reads.length;
+    const signedBackup = await saveEncrypted();
+    assert.deepEqual(signedBackup.key, keyBackup.key);
+    await cryptoLib.validateSubmission(signedBackup.key, signedBackup.submission);
+    assert.equal(a.button('Submit registration').props.disabled, true);
+    assert.equal(a.reads.length, readsBefore); assert.equal(a.orders.length, 0); assert.equal(a.signed.length, 1);
+    a.check('I saved the updated backup'); await a.click('Submit registration');
+    assert.equal(a.orders.length, 1); assert.equal(a.orders[0], JSON.stringify(signedBackup.submission.request));
+  } finally { globalThis.fetch = original; }
+});
