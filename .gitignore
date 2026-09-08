@@ -1,0 +1,13 @@
+node_modules/
+dist/
+outputs/
+output/
+.playwright-cli/
+coverage/
+.env*
+keys/
+*.pem
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*
+.railway/
