@@ -49,7 +49,7 @@ export async function runLocalCli(args = process.argv.slice(2)) {
       process.stdout.write(`BULK Keygen: http://127.0.0.1:${server.address().port}\nOpen this exact URL in the browser with Backpack installed.\nLocal files only. Account reads and registration still require BULK internet access.\nKeep this terminal open. Press Ctrl+C to stop.\nNext time: type node and a space, then drag START.mjs into your terminal.\n`);
       for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => server.close());
     } catch (e) {
-      process.stderr.write(e?.code === 'EADDRINUSE' ? 'The requested port or default range is busy. Choose another: node scripts/serve-local.mjs 3030\n' : e?.code === 'EACCES' || e?.code === 'EPERM' ? 'Local server access was blocked. Check your system policy; do not disable security protections or run as administrator.\n' : 'Local app files could not be opened. Extract a fresh local ZIP and run this command from that folder.\n'); process.exitCode = 1;
+      process.stderr.write(e?.code === 'EADDRINUSE' ? 'The requested port or default range is busy. Type node and a space, drag START.mjs into the terminal, then add a space and a free port such as 3030 before pressing Enter.\n' : e?.code === 'EACCES' || e?.code === 'EPERM' ? 'Local server access was blocked. Check your system policy; do not disable security protections or run as administrator.\n' : 'Local app files could not be opened. Extract a fresh local ZIP, then type node and a space and drag its START.mjs file into your terminal.\n'); process.exitCode = 1;
     }
   }
 }
