@@ -23,7 +23,7 @@ const child = '11111111111111111111111111111112';
 const code = ts.transpileModule(fs.readFileSync(new URL('../app/page.tsx', import.meta.url), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText;
 function all(n) { return !n || typeof n !== 'object' ? [] : [n, ...(Array.isArray(n) ? n : Object.values(n.props ?? {})).flatMap(all)]; }
 function text(n) { return typeof n === 'string' ? n : Array.isArray(n) ? n.map(text).join('') : n && typeof n === 'object' ? text(n.props?.children) : ''; }
-function fresh({ walletName = 'Phantom', agents = [] } = {}) {
+function fresh({ walletName = 'Phantom', agents = [], accountState = {}, orderReply = 'unknown' } = {}) {
   const state = [], refs = [], orders = [], signed = [], downloads = [], reads = [];
   let pauseRead = false, releaseRead, pauseSign = false, releaseSign, rejectSign, pauseConnect = false, releaseConnect, disconnect;
   let si = 0, ri = 0;
@@ -43,10 +43,12 @@ function fresh({ walletName = 'Phantom', agents = [] } = {}) {
   vm.runInNewContext(code, { exports, require: p => p === 'react' ? react : p === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : modules[p] ?? new Proxy({}, { get: (_, name) => String(name) }), window, Uint8Array, Blob, setTimeout(fn) { fn(); }, navigator: { clipboard: { writeText: async () => {} } }, URL: { createObjectURL(blob) { downloads.push(blob); return 'blob:test'; }, revokeObjectURL() {} }, document: { createElement() { return { click() {} }; } } });
   globalThis.fetch = async (url, options) => {
     const body = JSON.parse(options.body);
-    if (url.endsWith('/account')) { reads.push({ url, body }); if (pauseRead) { pauseRead = false; await new Promise(resolve => { releaseRead = resolve; }); } return new Response(JSON.stringify([{ fullAccount: body.user === owner ? { kind: 'MasterEOA', subAccounts: [{ pubkey: child }], authorizedAgentWallets: [...agents] } : { kind: 'SubAccount', parent: owner, authorizedAgentWallets: [...agents] } }])); }
+    if (url.endsWith('/account')) { reads.push({ url, body }); if (pauseRead) { pauseRead = false; await new Promise(resolve => { releaseRead = resolve; }); } return new Response(JSON.stringify([{ fullAccount: body.user === owner ? { kind: 'MasterEOA', subAccounts: [{ pubkey: child }], ...(accountState.omitAgents ? {} : { authorizedAgentWallets: [...agents] }) } : { kind: 'SubAccount', parent: owner, ...(accountState.omitAgents ? {} : { authorizedAgentWallets: [...agents] }) } }])); }
     assert.ok(url.endsWith('/order'));
     assert.deepEqual(options.headers, { 'Content-Type': 'application/json' });
-    orders.push(options.body); throw new TypeError('synthetic timeout');
+    orders.push(options.body);
+    if (orderReply === 'accepted') return new Response(JSON.stringify({ status: 'ok', response: { type: 'order', data: { statuses: [{ agentWallet: { agent_wallet: body.actions[0].agentWalletCreation.a } }] } } }));
+    throw new TypeError('synthetic timeout');
   };
   const render = () => { si = ri = 0; return exports.default(); };
   const button = label => { const n = all(render()).find(n => n.type === 'button' && (n.props['aria-label'] ?? text(n.props.children).trim()) === label); assert.ok(n, `Missing button ${label}`); return n; };
@@ -357,5 +359,43 @@ test('encrypted backup is visible beside JSON and saves signed recovery without 
     assert.equal(a.reads.length, readsBefore); assert.equal(a.orders.length, 0); assert.equal(a.signed.length, 1);
     a.check('I saved the updated backup'); await a.click('Submit registration');
     assert.equal(a.orders.length, 1); assert.equal(a.orders[0], JSON.stringify(signedBackup.submission.request));
+  } finally { globalThis.fetch = original; }
+});
+
+
+test('missing agent list after revoke stays unconfirmed and retries the same request without another signature', async () => {
+  const original = globalThis.fetch;
+  try {
+    for (const orderReply of ['unknown', 'accepted']) {
+      const agents = [], accountState = {};
+      const a = fresh({ walletName: 'Backpack', agents, accountState, orderReply });
+      await a.connect(); await a.child(); await a.click('Create agent key');
+      a.check('I saved my key'); await a.click('Sign registration'); await a.click('Save signed request backup');
+      const registered = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+      agents.push(registered.key.publicKey);
+      a.check('I saved the updated backup'); await a.click('Submit registration');
+      await a.click('Revoke access'); await a.click('Sign revoke request'); await a.click('Save signed request backup');
+      const revoked = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+      accountState.omitAgents = true;
+      a.check('I saved the updated backup'); await a.click('Submit revoke');
+      assert.match(text(a.render()), /Revoke unconfirmed/);
+      assert.match(text(a.render()), /BULK did not return the agent list/);
+      const actions = all(a.render()).find(n => n.props?.className === 'active-actions');
+      assert.match(text(actions), /Check status/);
+      assert.match(text(actions), /Retry original request/);
+      assert.doesNotMatch(text(actions), /Sign a new revoke request|Revoke access/);
+      const count = a.orders.length;
+      await a.click('Check status'); assert.equal(a.orders.length, count);
+      await a.click('Retry original request');
+      assert.equal(a.orders.length, count + 1);
+      assert.equal(a.orders.at(-1), JSON.stringify(revoked.submission.request));
+      assert.equal(a.signed.length, 2, 'retry must not request another signature');
+      assert.match(text(a.render()), /Revoke unconfirmed/);
+      accountState.omitAgents = false; agents.length = 0;
+      await a.click('Check status');
+      assert.match(text(a.render()), /Not listed/);
+      assert.ok(!all(a.render()).some(n => n.type === 'button' && text(n).trim() === 'Retry original request'));
+      assert.equal(a.orders.length, count + 1); assert.equal(a.signed.length, 2);
+    }
   } finally { globalThis.fetch = original; }
 });

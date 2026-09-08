@@ -186,7 +186,7 @@ export default function Home() {
       }
     }
     if (intent || stageRef.current !== 'created') setStage('pending');
-    setNotice(unavailable ? `BULK did not return the agent list. Status is unconfirmed. ${intent ? 'Save an updated backup' : 'Keep your backup'} and check again.` : intent === 'revoke'
+    setNotice(unavailable ? intent === 'revoke' ? 'BULK did not return the agent list. Revocation is unconfirmed. Keep your latest backup and check status again.' : `BULK did not return the agent list. Status is unconfirmed. ${intent ? 'Save an updated backup' : 'Keep your backup'} and check again.` : intent === 'revoke'
       ? 'Key is still active. Check again or retry the revoke request.'
       : 'Not confirmed yet. Save an updated backup to recover this request later.');
     return false;
@@ -202,7 +202,7 @@ export default function Home() {
     // A duplicate/error reply does not prove what happened to an earlier identical request.
     const confirmed = await checkRegistration(k, version, attempt.operation, result === 'accepted' ? 3 : 1);
     ensureContext(version);
-    if (!confirmed && result === 'rejected') setError('BULK rejected this request. Registration is not confirmed. Keep the signed backup and check status before retrying.');
+    if (!confirmed && result === 'rejected') setError(`BULK rejected this request. ${attempt.operation === 'revoke' ? 'Revocation' : 'Registration'} is not confirmed. Keep the signed backup and check status before retrying.`);
   }
   function authorize(operation: AgentOperation) { void run(operation === 'register' ? 'Preparing registration…' : 'Preparing revoke…', async version => {
     const canRevoke = stageRef.current === 'active' || stageRef.current === 'pending';
@@ -307,6 +307,7 @@ export default function Home() {
   const revokeDisabledReason = !walletReady ? 'Connect the owner wallet to revoke access.' : phantomSubaccount ? 'Phantom cannot revoke subaccount-only keys here. Connect Backpack with the same owner address.' : busy ? 'Wait for the current action to finish before revoking access.' : '';
   const canRegister = !!key && saved && walletReady && !phantomSubaccount && (key.account !== key.owner || masterScopeAccepted) && stage === 'created' && !submission && !busy;
   const networkLockReason = key ? 'Network locked to this key. Save your backup, then use More options to clear the key and switch.' : subaccountOwner ? 'Finish or save and close the pending subaccount request before switching networks.' : busy ? 'Wait for the current action to finish before switching networks.' : '';
+  const pendingRevoke = stage === 'pending' && submission?.operation === 'revoke';
   const downloadLabel = stage === 'created' ? 'Save key backup' : stage === 'signed' ? 'Save signed request backup' : 'Download latest backup';
   const currentStep = stage === 'created' ? saved ? 1 : 0 : stage === 'signing' ? 1 : stage === 'signed' ? recoverySaved ? 3 : 2 : 3;
   if (embedded) return <main className="shell"><h1>Open Keygen in its own tab</h1><p>Key and wallet actions are disabled inside embedded frames.</p></main>;
@@ -328,11 +329,11 @@ export default function Home() {
         {error && <div role="alert" className="message error">{error}</div>}
         {notice && <div role="status" className="message">{notice}</div>}
           {!key ? <><button className="btn full" onClick={createKey} disabled={!accountInfo || !walletReady || phantomSubaccount || !!subaccountOwner || !!busy}><KeyRound size={17}/> Create agent key</button><button className="btn text full" onClick={() => setDialog('import')} disabled={!!subaccountOwner || !!busy}><Upload size={16}/> Import saved key</button></> : <>
-          <div className="row between"><h2>Agent key</h2><span className={`status ${stage}`}>{labels[stage]}</span></div>
+          <div className="row between"><h2>Agent key</h2><span className={`status ${stage}`}>{pendingRevoke ? 'Revoke unconfirmed' : labels[stage]}</span></div>
           {!walletReady && <section className="owner-connection" aria-label="Owner wallet required"><strong>Wallet not connected</strong><p className="hint">Importing a backup does not connect your wallet. Connect the owner below to manage access.</p><code>{key.owner}</code><button className="btn primary full" disabled={!!busy} onClick={chooseWallet}><Wallet size={17}/> Connect owner wallet</button></section>}
           {history.length > 0 && <p className="hint">Your backup includes {history.length} earlier signed {history.length === 1 ? 'request' : 'requests'}. Keep the latest file; older signatures are not cancelled.</p>}
           {importedKeyOnly && !submission && <section className="stack" aria-label="Key-only backup"><p className="hint">This file has your key but no signed registration request. Check status to manage existing access. To finish a registration you started earlier, import its signed request backup.</p>{stage === 'absent' && <><p className="hint">No registration is listed. If you never signed a request for this key, clear it and create a new key.</p><button className="btn full" disabled={!!busy} onClick={() => setDialog('clear')}>Clear key to start again</button></>}</section>}
-          {walletReady && stage === 'pending' && <p className="hint">Check status to confirm whether this key is active before managing access.</p>}
+          {stage === 'pending' && <p className="hint">{pendingRevoke ? 'Check status first. If you still want to revoke access, retry the original request. No new wallet signature is needed.' : 'Check status to confirm whether this key is active before managing access.'}</p>}
           {submission?.operation !== 'revoke' && ['created', 'signing', 'signed', 'submitting'].includes(stage) && <nav className="key-steps" aria-label="Registration progress">{['Save key', 'Sign', 'Save request', 'Submit'].map((step, i) => <span key={step} aria-current={currentStep === i ? 'step' : undefined}>{i + 1}. {step}</span>)}</nav>}
           {stage === 'created' && !importedKeyOnly && <p className="hint">Save this key first. After signing, save the updated backup to resume registration if you close the page.</p>}
           <div className="field"><span className="label">Public key</span><div className="public-key"><code>{key.publicKey}</code><CopyKeyButton value={key.publicKey} label="Copy public key"/></div></div>
@@ -343,7 +344,7 @@ export default function Home() {
           </section>
           {stage === 'created' && <><label className="checkrow" htmlFor="key-saved"><Checkbox id="key-saved" checked={saved} onCheckedChange={v => setSaved(v === true)} disabled={!!busy}/><span>I saved my key and can restore it.</span></label>{key.account === key.owner && <label className="checkrow" htmlFor="master-scope"><Checkbox id="master-scope" checked={masterScopeAccepted} onCheckedChange={v => setMasterScopeAccepted(v === true)} disabled={!!busy}/><span>I authorize this key for my main account and all its subaccounts.</span></label>}<button className="btn primary full" onClick={() => authorize('register')} disabled={!canRegister}><Wallet size={17}/> Sign registration</button></>}
           {stage === 'signed' && <><p className="hint">Save an updated backup above in either format, then submit this exact request. Your earlier backup does not include this signature.</p><label className="checkrow" htmlFor="request-saved"><Checkbox id="request-saved" checked={recoverySaved} onCheckedChange={v => setRecoverySaved(v === true)} disabled={!!busy}/><span>I saved the updated backup containing this signed request.</span></label><button className="btn primary full" onClick={submitSigned} disabled={!!busy || !walletReady || !recoverySaved}>Submit {submission?.operation === 'revoke' ? 'revoke' : 'registration'}</button></>}
-          {(stage === 'active' || stage === 'pending') && <><div className="active-actions"><button className="btn" disabled={!!busy} onClick={verify}><RefreshCw size={16}/> Check status</button><button className="btn danger" disabled={!!revokeDisabledReason} aria-describedby={revokeDisabledReason ? 'revoke-disabled-reason' : undefined} onClick={() => setDialog('revoke')}><Ban size={16}/>{stage === 'pending' && submission?.operation === 'revoke' ? 'Sign a new revoke request' : 'Revoke access'}</button></div>{revokeDisabledReason && <p id="revoke-disabled-reason" className="hint">{revokeDisabledReason}</p>}</>}
+          {(stage === 'active' || stage === 'pending') && <><div className="active-actions"><button className="btn" disabled={!!busy} onClick={verify}><RefreshCw size={16}/> Check status</button>{pendingRevoke ? <button className="btn" disabled={!!busy || !walletReady} onClick={retry}><RefreshCw size={16}/> Retry original request</button> : <button className="btn danger" disabled={!!revokeDisabledReason} aria-describedby={revokeDisabledReason ? 'revoke-disabled-reason' : undefined} onClick={() => setDialog('revoke')}><Ban size={16}/>Revoke access</button>}</div>{!pendingRevoke && revokeDisabledReason && <p id="revoke-disabled-reason" className="hint">{revokeDisabledReason}</p>}</>}
           {stage === 'absent' && <button className="btn full" disabled={!!busy} onClick={verify}><RefreshCw size={16}/> Check status</button>}
           {stage === 'absent' && <p className="hint">For a pending request, import a backup saved after signing. Imported keys cannot be registered with a new request.</p>}
           {stage === 'revoked' && <p className="hint">BULK does not currently list this key on the selected account. Save an updated backup. Do not resubmit older registration requests.</p>}
@@ -353,7 +354,8 @@ export default function Home() {
               <button className="btn full" disabled={!!busy} onClick={() => setDialog('plaintext')}><Download size={16}/> Export JSON for bot</button>
               <p className="hint">Bot JSON contains only the key configuration. Both backups above include recovery details.</p>
               {stage !== 'active' && stage !== 'pending' && stage !== 'absent' && stage !== 'signed' && <button className="btn full" disabled={!!busy} onClick={verify}><RefreshCw size={16}/> Check status</button>}
-              {stage === 'pending' && submission && <><p className="hint">Retry only if you still want to {submission.operation === 'revoke' ? 'revoke access' : 'register this key'} and have not changed its access elsewhere. This resends the original signed request.</p><button className="btn full" disabled={!!busy || !walletReady} onClick={retry}><RefreshCw size={16}/> Retry original request</button></>}
+              {stage === 'pending' && submission && !pendingRevoke && <><p className="hint">Retry only if you still want to {submission.operation === 'revoke' ? 'revoke access' : 'register this key'} and have not changed its access elsewhere. This resends the original signed request.</p><button className="btn full" disabled={!!busy || !walletReady} onClick={retry}><RefreshCw size={16}/> Retry original request</button></>}
+              {pendingRevoke && <><p className="hint">Try the original request first. Signing again creates another request; it does not cancel the saved one.</p><button className="btn danger full" disabled={!!revokeDisabledReason} aria-describedby={revokeDisabledReason ? 'revoke-disabled-reason' : undefined} onClick={() => setDialog('revoke')}><Ban size={16}/> Sign a new revoke request</button>{revokeDisabledReason && <p id="revoke-disabled-reason" className="hint">{revokeDisabledReason}</p>}</>}
               <button className="btn text full" disabled={!!busy} onClick={() => setDialog('clear')}><Trash2 size={15}/> Clear key from page</button>
             </div></CollapsibleContent>
           </Collapsible>
