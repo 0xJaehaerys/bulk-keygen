@@ -52,7 +52,10 @@ test('Phantom master registration and revoke verify Base58 text and preserve rec
         await assert.rejects(() => finalizeRegistration(prepared, signature, key, operation), /signature does not match/);
         const rawSignature = new Uint8Array(sign(null, prepared.messageBytes, signer));
         await assert.rejects(() => finalizeRegistration(prepared, rawSignature, key, operation, 'base58'), /signature does not match/);
-        await assert.rejects(() => decryptVault(exportBackup(key, { ...attempt, signatureMode: 'unknown' }), '', true), /signing mode/);
+        assert.throws(() => exportBackup(key, { ...attempt, signatureMode: 'unknown' }), /signing mode/);
+        const malformed = JSON.parse(exportBackup(key, attempt));
+        malformed.submission.signatureMode = 'unknown';
+        await assert.rejects(() => decryptVault(JSON.stringify(malformed), '', true), /signing mode/);
       } finally { prepared.free(); }
     }
   }

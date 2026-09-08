@@ -7,7 +7,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { AlertDialog, AlertDialogContent, AlertDialogTitle, AlertDialogDescription } from '@/components/ui/alert-dialog';
-import { exportBackup, encryptVault, decryptVault, MAX_VAULT_BYTES } from '@/lib/vault';
+import { exportBackup, encryptVault, decryptVault, MAX_VAULT_BYTES, appendSubmissionHistory } from '@/lib/vault';
 import { NETWORKS, BulkError, agentMembership, assertOwner, exportKey, friendlyError, readAccount, readbackState, shortKey, submitRegistration } from '@/lib/bulk';
 import type { AgentKey, FullAccount, Network, RegistrationState, AgentOperation, Submission } from '@/lib/bulk';
 import { finalizeRegistration, generateKey, prepareRegistration, registrationMessage, validateKeypair, validateSubmission } from '@/lib/crypto';
@@ -38,6 +38,9 @@ export default function Home() {
   const [showSecret, setShowSecret] = useState(false);
   const [stage, setStageState] = useState<RegistrationState>('created');
   const [submission, setSubmissionState] = useState<Submission | null>(null);
+  const [history, setHistory] = useState<Submission[]>([]);
+  const [importedKeyOnly, setImportedKeyOnly] = useState(false);
+  const [canStopWaiting, setCanStopWaiting] = useState(false);
   const [dialog, setDialog] = useState<'export' | 'import' | 'plaintext' | 'revoke' | 'clear' | 'wallet' | 'wallet-account' | null>(null);
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -51,6 +54,8 @@ export default function Home() {
   const provider = useRef<WalletConnection | null>(null);
   const epoch = useRef(0);
   const busyRef = useRef(false);
+  const activeRun = useRef(0);
+  const runPending = useRef(false);
   const unsubscribe = useRef<(() => void) | null>(null);
   const keyRef = useRef<AgentKey | null>(null);
   const submissionRef = useRef<Submission | null>(null);
@@ -70,7 +75,7 @@ export default function Home() {
       if (provider.current && !provider.current.publicKey) invalidateWallet();
       setWalletAccounts(current => current.filter(connection => connection.publicKey));
     }) : () => {};
-    return () => { epoch.current++; unsubscribe.current?.(); stopWatching(); window.removeEventListener('beforeunload', preventLoss); };
+    return () => { epoch.current++; activeRun.current++; unsubscribe.current?.(); stopWatching(); window.removeEventListener('beforeunload', preventLoss); };
   }, []);
 
   function ensureContext(version: number, expectedOwner?: string) {
@@ -80,16 +85,27 @@ export default function Home() {
   async function run(label: string, task: (version: number) => Promise<void>) {
     if (window.self !== window.top) { setEmbedded(true); return; }
     if (busyRef.current) return;
-    busyRef.current = true; setBusy(label); setError(''); setNotice('');
-    const version = epoch.current;
-    try { await task(version); } catch (e) { setError(friendlyError(e)); } finally { busyRef.current = false; setBusy(''); }
+    const operation = ++activeRun.current;
+    busyRef.current = true; runPending.current = true; setBusy(label); setCanStopWaiting(true); setError(''); setNotice('');
+    const version = ++epoch.current;
+    try { await task(version); } catch (e) { if (activeRun.current === operation) setError(friendlyError(e)); }
+    finally { if (activeRun.current === operation) { runPending.current = false; busyRef.current = false; setBusy(''); setCanStopWaiting(false); } }
   }
   function invalidateWallet() {
-    epoch.current++; setOwner(''); setWalletName(''); setAccounts([]); setAccountInfo(null);
+    epoch.current++; activeRun.current++;
+    if (runPending.current) { runPending.current = false; busyRef.current = false; setBusy(''); setCanStopWaiting(false); }
+    unsubscribe.current?.(); unsubscribe.current = null; provider.current = null;
+    setOwner(''); setWalletName(''); setAccounts([]); setAccountInfo(null);
     if (!keyRef.current) setAccount('');
     if (stageRef.current === 'submitting') setStage('pending');
     if (stageRef.current === 'signing') setStage(beforeSigning.current);
     setError(keyRef.current ? 'Wallet disconnected or changed. Your key is still here. Reconnect its owner.' : 'Wallet disconnected or changed. Connect your wallet again.');
+  }
+  function stopWaiting() {
+    if (!runPending.current) return;
+    invalidateWallet();
+    setError('');
+    setNotice('Stopped waiting. Close any open wallet prompt before reconnecting. Signed or submitted requests are not cancelled.');
   }
   function bindProvider(p: WalletConnection) {
     unsubscribe.current?.(); provider.current = p;
@@ -110,42 +126,44 @@ export default function Home() {
     if (busyRef.current) return;
     setWallets(availableWallets()); setDialog('wallet');
   }
-  async function activateConnection(p: WalletConnection) {
+  async function activateConnection(p: WalletConnection, version: number) {
+    ensureContext(version);
     const wallet = p.publicKey?.toString();
     if (!wallet) throw new BulkError('Wallet account is no longer available. Connect again.');
     if (keyRef.current && wallet !== keyRef.current.owner) throw new BulkError('This key belongs to another wallet account. Select its owner in your wallet.');
     if (subaccountOwner && wallet !== subaccountOwner) throw new BulkError('Reconnect the wallet that signed the subaccount request.');
     bindProvider(p);
-    const version = ++epoch.current; setOwner(wallet); setWalletName(p.name); setAccounts([]); setAccountInfo(null); setBusy('Loading BULK accounts…');
+    setOwner(wallet); setWalletName(p.name); setAccounts([]); setAccountInfo(null); setBusy('Loading BULK accounts…');
     await loadAccounts(network, wallet, version, keyRef.current?.account);
   }
-  function connect(option: WalletOption) { closeDialog(); void run(`Connecting ${option.name}…`, async () => {
+  function connect(option: WalletOption) { closeDialog(); void run(`Connecting ${option.name}…`, async version => {
     unsubscribe.current?.(); unsubscribe.current = null; provider.current = null;
-    epoch.current++; setOwner(''); setWalletName(''); setAccounts([]); setAccountInfo(null);
+    setOwner(''); setWalletName(''); setAccounts([]); setAccountInfo(null);
     let connections: WalletConnection[];
     try { connections = await option.connect(); } catch (e) { throw connectionError(e, option.name); }
+    ensureContext(version);
     const expectedOwner = keyRef.current?.owner || subaccountOwner;
     const eligible = expectedOwner ? connections.filter(c => c.publicKey?.toString() === expectedOwner) : connections;
     if (!eligible.length) throw new BulkError('Select the account that owns this key in your wallet, then connect again.');
     if (eligible.length > 1) { setWalletAccounts(eligible); setDialog('wallet-account'); return; }
-    await activateConnection(eligible[0]);
+    await activateConnection(eligible[0], version);
   }); }
   function changeNetwork(value: Network) {
     if (key || subaccountOwner || busyRef.current || value === network) return;
-    const version = ++epoch.current; setNetwork(value); setAccounts([]); setAccount(''); setAccountInfo(null); setError('');
-    if (owner) void run('Loading accounts…', () => loadAccounts(value, owner, version));
+    epoch.current++; setNetwork(value); setAccounts([]); setAccount(''); setAccountInfo(null); setError('');
+    if (owner) void run('Loading accounts…', current => loadAccounts(value, owner, current));
   }
   function selectAccount(value: string) {
     if (key || subaccountOwner || busyRef.current || value === account) return;
-    const version = ++epoch.current; setAccount(value); setAccountInfo(null); setMasterScopeAccepted(false);
-    void run('Checking account…', async () => { const info = await readAccount(network, value); ensureContext(version, owner); assertOwner(info, value, owner); setAccountInfo(info); });
+    epoch.current++; setAccount(value); setAccountInfo(null); setMasterScopeAccepted(false);
+    void run('Checking account…', async version => { const info = await readAccount(network, value); ensureContext(version, owner); assertOwner(info, value, owner); setAccountInfo(info); });
   }
   function createKey() { void run('Creating key…', async version => {
     if (!owner || !accountInfo || key || subaccountOwner) return;
     registrationModeForWallet(provider.current?.name ?? '', account, owner);
     ensureContext(version, owner); assertOwner(accountInfo, account, owner);
     const generated = await generateKey(network, account, owner);
-    ensureContext(version, owner); setKey(generated); setSubmission(null); setSaved(false); setMasterScopeAccepted(false); setStage('created'); setShowSecret(false);
+    ensureContext(version, owner); setKey(generated); setSubmission(null); setHistory([]); setImportedKeyOnly(false); setSaved(false); setMasterScopeAccepted(false); setStage('created'); setShowSecret(false);
     setNotice('Key created. Save key backup before registering.');
   }); }
   async function checkRegistration(k: AgentKey, version: number, intent: AgentOperation | null, attempts = 1): Promise<boolean> {
@@ -183,6 +201,7 @@ export default function Home() {
     ensureContext(version); setStage('pending');
     // A duplicate/error reply does not prove what happened to an earlier identical request.
     const confirmed = await checkRegistration(k, version, attempt.operation, result === 'accepted' ? 3 : 1);
+    ensureContext(version);
     if (!confirmed && result === 'rejected') setError('BULK rejected this request. Registration is not confirmed. Keep the signed backup and check status before retrying.');
   }
   function authorize(operation: AgentOperation) { void run(operation === 'register' ? 'Preparing registration…' : 'Preparing revoke…', async version => {
@@ -190,7 +209,9 @@ export default function Home() {
     if (!key || !owner || (operation === 'register' ? (!saved || stageRef.current !== 'created' || submissionRef.current) : !canRevoke)) return;
     if (operation === 'register' && key.account === key.owner && !masterScopeAccepted) throw new BulkError('Confirm that this key will cover your main account and all subaccounts.');
     const signatureMode = registrationModeForWallet(provider.current?.name ?? '', key.account, key.owner);
-    beforeSigning.current = stageRef.current;
+    const previousStage = stageRef.current;
+    beforeSigning.current = previousStage;
+    const nextHistory = appendSubmissionHistory(history, submissionRef.current);
     let prepared: Awaited<ReturnType<typeof prepareRegistration>> | undefined;
     let step: AuthorizationStep = 'account';
     try {
@@ -207,11 +228,14 @@ export default function Home() {
       if (signed.publicKey && signed.publicKey.toString() !== key.owner) throw new BulkError('A different wallet signed the request.');
       step = 'verify';
       const request = await finalizeRegistration(prepared, new Uint8Array(signed.signature), key, operation, signatureMode); ensureContext(version, key.owner);
-      // Replacing an add with a revoke permanently disables add retry in this session.
-      const attempt = { operation, request, signatureMode }; setSubmission(attempt);
+      // Previous signatures remain valid evidence; retries use only the current request.
+      const attempt = { operation, request, signatureMode };
+      exportBackup(key, attempt, nextHistory); // Check recoverability before committing the signed request.
+      setHistory(nextHistory); setSubmission(attempt);
       setStage('signed'); setNotice('Signed, not sent. Save signed request backup above before submitting.');
     } catch (e) {
-      setStage(beforeSigning.current); throw authorizationError(e, step, provider.current?.name);
+      if (epoch.current === version) setStage(previousStage);
+      throw authorizationError(e, step, provider.current?.name);
     } finally { prepared?.free(); }
   }); }
   function submitSigned() { void run('Submitting signed request…', async version => {
@@ -237,8 +261,8 @@ export default function Home() {
   }
   function downloadKey() {
     if (!key || busyRef.current) return;
-    saveFile(exportBackup(key, submissionRef.current), `bulk-${key.network}-${key.publicKey.slice(0, 8)}.json`);
-    setNotice(submissionRef.current ? 'JSON downloaded with your key and latest recovery request. Keep it private.' : 'JSON downloaded. Keep it private and confirm you saved your key.');
+    saveFile(exportBackup(key, submissionRef.current, history), `bulk-${key.network}-${key.publicKey.slice(0, 8)}.json`);
+    setNotice(submissionRef.current ? 'JSON downloaded with your key and signed request history. Keep it private.' : 'JSON downloaded. Keep it private and confirm you saved your key.');
   }
   async function vaultAction() {
     if (window.self !== window.top) { setEmbedded(true); return; }
@@ -247,7 +271,7 @@ export default function Home() {
     try {
       if (dialog === 'export' && key) {
         if (password !== confirmPassword) throw new BulkError('Passwords do not match.');
-        const encrypted = await encryptVault(key, password, submissionRef.current);
+        const encrypted = await encryptVault(key, password, submissionRef.current, history);
         saveFile(encrypted, `bulk-${key.network}-${key.publicKey.slice(0, 8)}.encrypted.json`);
         closeDialog(); setNotice('Backup downloaded. Keep your password separately; it cannot be recovered.');
       } else if (dialog === 'import' && !key) {
@@ -259,14 +283,15 @@ export default function Home() {
         let format: unknown;
         try { format = JSON.parse(contents)?.format; } catch { throw new BulkError('Could not read the key JSON file.'); }
         if (importKind === 'json' && format === 'bulk-agent-vault-v1') throw new BulkError('This file is encrypted. Choose Encrypted backup and enter its password.');
-        if (importKind === 'encrypted' && (format === 'bulk-agent-key-v1' || format === 'bulk-agent-backup-v1')) throw new BulkError('This file is not encrypted. Choose JSON backup; no password is needed.');
+        if (importKind === 'encrypted' && (format === 'bulk-agent-key-v1' || format === 'bulk-agent-backup-v1' || format === 'bulk-agent-backup-v2')) throw new BulkError('This file is not encrypted. Choose JSON backup; no password is needed.');
         const backup = await decryptVault(contents, password, importKind === 'json');
         await validateKeypair(backup.key);
+        for (const previous of backup.history) await validateSubmission(backup.key, previous);
         if (backup.submission) await validateSubmission(backup.key, backup.submission);
         // Commit only after every local validation passes. Imported status is never authoritative.
         epoch.current++; unsubscribe.current?.(); unsubscribe.current = null; provider.current = null;
         setOwner(''); setWalletName(''); setAccounts([]); setAccountInfo(null); setNetwork(backup.key.network); setAccount(backup.key.account);
-        setKey(backup.key); setSubmission(backup.submission); setRecoverySaved(!!backup.submission); setSaved(true); setMasterScopeAccepted(false); setShowSecret(false);
+        setKey(backup.key); setSubmission(backup.submission); setHistory(backup.history); setImportedKeyOnly(!backup.submission && backup.history.length === 0); setRecoverySaved(!!backup.submission); setSaved(true); setMasterScopeAccepted(false); setShowSecret(false);
         setStage('pending'); closeDialog();
         setNotice('Key imported. Connect the owner wallet below, then check status to manage access.');
       }
@@ -274,14 +299,14 @@ export default function Home() {
     finally { busyRef.current = false; setBusy(''); }
   }
   function clearKey() {
-    epoch.current++; setKey(null); setSubmission(null); setSaved(false); setMasterScopeAccepted(false); setShowSecret(false); setStage('created'); setAccountInfo(null); setAccounts([]); setAccount('');
+    epoch.current++; setKey(null); setSubmission(null); setHistory([]); setImportedKeyOnly(false); setSaved(false); setMasterScopeAccepted(false); setShowSecret(false); setStage('created'); setAccountInfo(null); setAccounts([]); setAccount('');
     closeDialog(); setNotice('Key cleared from this page. Its BULK access is unchanged.');
   }
   const walletReady = !!owner && (!key || owner === key.owner);
   const phantomSubaccount = isPhantomWallet(walletName) && !!account && !!owner && account !== owner;
   const revokeDisabledReason = !walletReady ? 'Connect the owner wallet to revoke access.' : phantomSubaccount ? 'Phantom cannot revoke subaccount-only keys here. Connect Backpack with the same owner address.' : busy ? 'Wait for the current action to finish before revoking access.' : '';
   const canRegister = !!key && saved && walletReady && !phantomSubaccount && (key.account !== key.owner || masterScopeAccepted) && stage === 'created' && !submission && !busy;
-  const networkLockReason = key ? 'Network locked to this key. Save your backup, then use More options to clear the key and switch.' : subaccountOwner ? 'Finish the pending subaccount request before switching networks.' : busy ? 'Wait for the current action to finish before switching networks.' : '';
+  const networkLockReason = key ? 'Network locked to this key. Save your backup, then use More options to clear the key and switch.' : subaccountOwner ? 'Finish or save and close the pending subaccount request before switching networks.' : busy ? 'Wait for the current action to finish before switching networks.' : '';
   const downloadLabel = stage === 'created' ? 'Save key backup' : stage === 'signed' ? 'Save signed request backup' : 'Download latest backup';
   const currentStep = stage === 'created' ? saved ? 1 : 0 : stage === 'signing' ? 1 : stage === 'signed' ? recoverySaved ? 3 : 2 : 3;
   if (embedded) return <main className="shell"><h1>Open Keygen in its own tab</h1><p>Key and wallet actions are disabled inside embedded frames.</p></main>;
@@ -294,7 +319,7 @@ export default function Home() {
         <NetworkSwitcher value={network} onChange={changeNetwork} lockedReason={networkLockReason}/>
         {owner ? <div className="wallet-row"><div><span className="label" title="Previously approved sites may reconnect without a new approval prompt.">Connected · {walletName}</span><code title={owner}>{shortKey(owner)}</code></div><button className="btn text" aria-label="Change wallet" disabled={!!busy} onClick={chooseWallet}>Change</button></div> : <button className="btn primary full" onClick={chooseWallet} disabled={!!busy}><Wallet size={17}/> Connect wallet</button>}
         {accounts.length > 0 ? <div className="field"><label id="account-label" className="label">Account</label><Select value={account} onValueChange={v => v && selectAccount(v)} disabled={!!key || !!subaccountOwner || !!busy}><SelectTrigger className="account-select" aria-labelledby="account-label"><SelectValue>{account === owner ? 'Main account' : 'Subaccount'} · {shortKey(account)}</SelectValue></SelectTrigger><SelectContent>{accounts.map(a => <SelectItem key={a} value={a}>{a === owner ? 'Main account' : 'Subaccount'} · {shortKey(a)}</SelectItem>)}</SelectContent></Select></div> : key ? <div className="wallet-row"><span className="label">Account</span><code title={key.account}>{shortKey(key.account)}</code></div> : owner ? <button className="btn full" disabled={!!busy} onClick={() => void run('Loading accounts…', v => loadAccounts(network, owner, v))}>Load accounts</button> : <p className="hint">Connect the owner wallet to create or select a BULK subaccount.</p>}
-        <SubaccountCreator network={network} owner={owner} hasKey={!!key} busy={!!busy} wallet={() => provider.current} run={run} ensureContext={ensureContext} onPendingChange={setSubaccountOwner} onVerified={(address, info) => { setAccounts(current => Array.from(new Set([...current, address]))); setAccount(address); setAccountInfo(info); setNotice('Subaccount selected. Create its agent key below.'); }}/>
+        <SubaccountCreator network={network} owner={owner} hasKey={!!key} busy={!!busy} wallet={() => provider.current} run={run} onStopWaiting={stopWaiting} ensureContext={ensureContext} onPendingChange={setSubaccountOwner} onVerified={(address, info) => { setAccounts(current => Array.from(new Set([...current, address]))); setAccount(address); setAccountInfo(info); setNotice('Subaccount selected. Create its agent key below.'); }}/>
         {accountInfo?.kind === 'MasterEOA' && <p className="hint account-note">Main account keys also cover all subaccounts.</p>}
         {phantomSubaccount && <output className="hint account-note">{PHANTOM_SUBACCOUNT_MESSAGE}</output>}
         {accountInfo?.kind === 'MasterEOA' && accountInfo.subAccounts === null && <p className="hint">BULK did not return a subaccount list. Showing your main account.</p>}
@@ -305,8 +330,11 @@ export default function Home() {
           {!key ? <><button className="btn full" onClick={createKey} disabled={!accountInfo || !walletReady || phantomSubaccount || !!subaccountOwner || !!busy}><KeyRound size={17}/> Create agent key</button><button className="btn text full" onClick={() => setDialog('import')} disabled={!!subaccountOwner || !!busy}><Upload size={16}/> Import saved key</button></> : <>
           <div className="row between"><h2>Agent key</h2><span className={`status ${stage}`}>{labels[stage]}</span></div>
           {!walletReady && <section className="owner-connection" aria-label="Owner wallet required"><strong>Wallet not connected</strong><p className="hint">Importing a backup does not connect your wallet. Connect the owner below to manage access.</p><code>{key.owner}</code><button className="btn primary full" disabled={!!busy} onClick={chooseWallet}><Wallet size={17}/> Connect owner wallet</button></section>}
+          {history.length > 0 && <p className="hint">Your backup includes {history.length} earlier signed {history.length === 1 ? 'request' : 'requests'}. Keep the latest file; older signatures are not cancelled.</p>}
+          {importedKeyOnly && !submission && <section className="stack" aria-label="Key-only backup"><p className="hint">This file has your key but no signed registration request. Check status to manage existing access. To finish a registration you started earlier, import its signed request backup.</p>{stage === 'absent' && <><p className="hint">No registration is listed. If you never signed a request for this key, clear it and create a new key.</p><button className="btn full" disabled={!!busy} onClick={() => setDialog('clear')}>Clear key to start again</button></>}</section>}
           {walletReady && stage === 'pending' && <p className="hint">Check status to confirm whether this key is active before managing access.</p>}
           {submission?.operation !== 'revoke' && ['created', 'signing', 'signed', 'submitting'].includes(stage) && <nav className="key-steps" aria-label="Registration progress">{['Save key', 'Sign', 'Save request', 'Submit'].map((step, i) => <span key={step} aria-current={currentStep === i ? 'step' : undefined}>{i + 1}. {step}</span>)}</nav>}
+          {stage === 'created' && !importedKeyOnly && <p className="hint">Save this key first. After signing, save the updated backup to resume registration if you close the page.</p>}
           <div className="field"><span className="label">Public key</span><div className="public-key"><code>{key.publicKey}</code><CopyKeyButton value={key.publicKey} label="Copy public key"/></div></div>
           <div className="field"><div className="row between"><span className="label">Private key</span><div className="row"><button className="btn icon" aria-label={showSecret ? 'Hide private key' : 'Show private key'} onClick={() => setShowSecret(v => !v)}>{showSecret ? <EyeOff size={16}/> : <Eye size={16}/>}</button><CopyKeyButton value={key.secretKey} label="Copy private key"/></div></div><code className="key-value">{showSecret ? key.secretKey : '••••••••••••••••••••••••••••••••'}</code></div>
           <button className={`btn ${stage === 'created' && !saved || stage === 'signed' && !recoverySaved ? 'primary' : ''} full`} disabled={!!busy} onClick={downloadKey}><Download size={17}/> {downloadLabel}</button>
@@ -330,15 +358,16 @@ export default function Home() {
           </Collapsible>
         </>}
         {busy && <div role="status" className="busy"><LoaderCircle size={16} className="spin"/>{stage === 'signing' ? `Confirm in ${walletName || 'your wallet'}…` : busy}</div>}
+        {canStopWaiting && <button className="btn text full" onClick={stopWaiting}>Stop waiting</button>}
       </div>
     </section>
-    <footer><a href="https://github.com/0xJaehaerys/bulk-keygen" target="_blank" rel="noopener noreferrer">Source code</a> · Not affiliated with BULK</footer>
+    <footer><a href="https://github.com/0xJaehaerys/bulk-keygen" target="_blank" rel="noopener noreferrer" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, verticalAlign: 'middle' }}><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>Source code</a> · Not affiliated with BULK</footer>
     <Dialog open={dialog === 'wallet' || dialog === 'wallet-account'} onOpenChange={open => { if (!open && !busyRef.current) closeDialog(); }}>
       <DialogContent className="vault-dialog">
         <DialogTitle>{dialog === 'wallet-account' ? 'Choose wallet account' : 'Connect wallet'}</DialogTitle>
         <DialogDescription>{dialog === 'wallet-account' ? 'Select the account that owns your BULK account.' : 'Backpack is recommended for subaccounts and agent keys. Phantom supports main-account agent keys only in this tool.'}</DialogDescription>
         <div className="stack">
-          {dialog === 'wallet-account' ? walletAccounts.map(connection => <button key={`${connection.id}:${connection.publicKey?.toString()}`} className="btn full" disabled={!!busy || !connection.publicKey} title={connection.publicKey?.toString()} onClick={() => { closeDialog(); void run('Loading BULK accounts…', () => activateConnection(connection)); }}><code>{connection.publicKey ? shortKey(connection.publicKey.toString()) : 'Unavailable'}</code></button>) : wallets.map(option => <button key={option.id} className="btn full wallet-option" aria-label={option.name} disabled={!!busy} onClick={() => connect(option)}><Wallet size={17}/> {option.name}{option.name.toLowerCase() === 'backpack' && <span className="recommendation">Recommended</span>}{option.name.toLowerCase() === 'phantom' && <span className="wallet-limit">Main account only</span>}</button>)}
+          {dialog === 'wallet-account' ? walletAccounts.map(connection => <button key={`${connection.id}:${connection.publicKey?.toString()}`} className="btn full" disabled={!!busy || !connection.publicKey} title={connection.publicKey?.toString()} onClick={() => { closeDialog(); void run('Loading BULK accounts…', version => activateConnection(connection, version)); }}><code>{connection.publicKey ? shortKey(connection.publicKey.toString()) : 'Unavailable'}</code></button>) : wallets.map(option => <button key={option.id} className="btn full wallet-option" aria-label={option.name} disabled={!!busy} onClick={() => connect(option)}><Wallet size={17}/> {option.name}{option.name.toLowerCase() === 'backpack' && <span className="recommendation">Recommended</span>}{option.name.toLowerCase() === 'phantom' && <span className="wallet-limit">Main account only</span>}</button>)}
           {dialog === 'wallet' && wallets.length === 0 && <><p className="hint">No compatible wallet found. Install or enable Backpack in this browser, then refresh the list.</p><button className="btn full" onClick={() => setWallets(availableWallets())}>Refresh wallets</button></>}
           <a className="quiet-link" href="https://backpack.app/" target="_blank" rel="noreferrer">Get Backpack from its official website ↗</a><p className="hint">Connect the owner of your BULK account. Mobile and hardware wallets may not support message signing. Email login is not supported.</p>
           <button className="btn text full" onClick={closeDialog}>Cancel</button>

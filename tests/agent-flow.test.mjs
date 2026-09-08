@@ -25,14 +25,17 @@ function all(n) { return !n || typeof n !== 'object' ? [] : [n, ...(Array.isArra
 function text(n) { return typeof n === 'string' ? n : Array.isArray(n) ? n.map(text).join('') : n && typeof n === 'object' ? text(n.props?.children) : ''; }
 function fresh({ walletName = 'Phantom', agents = [] } = {}) {
   const state = [], refs = [], orders = [], signed = [], downloads = [], reads = [];
-  let pauseRead = false, releaseRead;
+  let pauseRead = false, releaseRead, pauseSign = false, releaseSign, rejectSign, pauseConnect = false, releaseConnect, disconnect;
   let si = 0, ri = 0;
   const react = { useEffect() {}, useRef(v) { return refs[ri++] ??= { current: v }; }, useState(v) { const i = si++; if (!(i in state)) state[i] = v; return [state[i], next => { state[i] = typeof next === 'function' ? next(state[i]) : next; }]; } };
-  const connection = { id: 'test-phantom', name: walletName, publicKey: { toString: () => owner }, subscribe() { return () => {}; }, async signMessage(bytes, display) {
+  const connection = { id: 'test-phantom', name: walletName, publicKey: { toString: () => owner }, subscribe(listener) { disconnect = listener; return () => {}; }, async signMessage(bytes, display) {
     assert.equal(display, walletName === 'Phantom' ? 'utf8' : 'hex'); if (walletName === 'Phantom') new TextDecoder('utf8', { fatal: true }).decode(bytes);
-    signed.push(Uint8Array.from(bytes)); return { signature: new Uint8Array(sign(null, bytes, pair.privateKey)), publicKey: this.publicKey };
+    signed.push(Uint8Array.from(bytes));
+    const result = { signature: new Uint8Array(sign(null, bytes, pair.privateKey)), publicKey: this.publicKey };
+    if (pauseSign) { pauseSign = false; return new Promise((resolve, reject) => { releaseSign = () => resolve(result); rejectSign = () => reject(new Error('Late wallet rejection')); }); }
+    return result;
   } };
-  const option = { id: 'test-phantom', name: walletName, async connect() { return [connection]; } };
+  const option = { id: 'test-phantom', name: walletName, async connect() { if (pauseConnect) { pauseConnect = false; return new Promise(resolve => { releaseConnect = () => resolve([connection]); }); } return [connection]; } };
   const providers = { availableWallets: () => [option], watchWallets: () => () => {} };
   const jsx = (type, props) => ({ type, props });
   const modules = { '@/lib/bulk': bulk, '@/lib/crypto': cryptoLib, '@/lib/vault': vault, '@/lib/wallet': walletLib, '@/lib/wallet-providers': providers };
@@ -50,7 +53,7 @@ function fresh({ walletName = 'Phantom', agents = [] } = {}) {
   const check = label => { const n = all(render()).find(n => n.type === 'label' && text(n).includes(label)); assert.ok(n, label); all(n).find(n => n.type === 'Checkbox').props.onCheckedChange(true); };
   const settle = async () => { for (let i = 0; i < 1000; i++) { render(); if (!refs[2]?.current) return; await new Promise(resolve => setTimeout(resolve, 1)); } assert.fail('UI did not settle'); };
   const click = async label => { const b = button(label); assert.ok(!b.props.disabled, `${label} disabled`); b.props.onClick(); await settle(); };
-  return { render, button, check, settle, click, orders, signed, downloads, reads, network() { return all(render()).find(n => n.type === 'NetworkSwitcher').props; }, holdRead() { pauseRead = true; }, releaseRead() { releaseRead(); }, async connect() { await click('Connect wallet'); await click(walletName); }, async child() { const select = all(render()).find(n => n.type === 'Select' && n.props.value === owner); assert.ok(select); select.props.onValueChange(child); await settle(); } };
+  return { render, button, check, settle, click, orders, signed, downloads, reads, network() { return all(render()).find(n => n.type === 'NetworkSwitcher').props; }, holdSign() { pauseSign = true; }, releaseSign() { releaseSign(); }, rejectSign() { rejectSign(); }, holdConnect() { pauseConnect = true; }, releaseConnect() { releaseConnect(); }, disconnect() { disconnect(); }, async waitSign() { for (let i = 0; i < 1000 && !releaseSign; i++) await new Promise(resolve => setTimeout(resolve, 1)); assert.ok(releaseSign); }, async waitRead() { for (let i = 0; i < 1000 && !releaseRead; i++) await new Promise(resolve => setTimeout(resolve, 1)); assert.ok(releaseRead); }, holdRead() { pauseRead = true; }, releaseRead() { releaseRead(); }, async connect() { await click('Connect wallet'); await click(walletName); }, async child() { const select = all(render()).find(n => n.type === 'Select' && n.props.value === owner); assert.ok(select); select.props.onValueChange(child); await settle(); } };
 }
 
 test('Phantom UI requires main scope, signs text, saves exact request before submit and retries without signing again', async () => {
@@ -202,5 +205,120 @@ test('encrypted restore explains owner reconnect and enables scoped revoke only 
     assert.equal(revoked.key.account, child); assert.equal(revoked.key.owner, owner);
     await cryptoLib.validateSubmission(revoked.key, revoked.submission);
     assert.equal(a.orders.length, ordersBefore, 'revoke needs explicit backup acknowledgement and submit');
+  } finally { globalThis.fetch = original; }
+});
+
+
+test('Stop waiting preserves keys and ignores a late signature without unlocking a newer action', async () => {
+  const original = globalThis.fetch;
+  try {
+    const a = fresh({ walletName: 'Backpack' }); await a.connect(); await a.child(); await a.click('Create agent key');
+    a.check('I saved my key'); a.holdSign(); a.button('Sign registration').props.onClick(); await a.waitSign();
+    assert.equal(a.button('Download latest backup').props.disabled, true);
+    await a.click('Stop waiting');
+    assert.match(text(a.render()), /Signed or submitted requests are not cancelled/);
+    assert.equal(a.button('Save key backup').props.disabled, false);
+    await a.click('Save key backup');
+    const saved = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+    assert.equal(saved.submission, null);
+    await a.click('Connect owner wallet'); a.holdRead(); a.button('Backpack').props.onClick(); await a.waitRead();
+    a.releaseSign(); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(a.button('Save key backup').props.disabled, true, 'late finally must not clear new operation busy');
+    assert.equal(a.orders.length, 0);
+    a.releaseRead(); await a.settle();
+    assert.equal(a.button('Sign registration').props.disabled, false);
+    assert.equal(a.signed.length, 1); assert.equal(a.orders.length, 0);
+  } finally { globalThis.fetch = original; }
+});
+
+test('wallet disconnect releases a never-settled sign and ignores its late error', async () => {
+  const original = globalThis.fetch;
+  try {
+    const a = fresh({ walletName: 'Backpack' }); await a.connect(); await a.child(); await a.click('Create agent key');
+    a.check('I saved my key'); a.holdSign(); a.button('Sign registration').props.onClick(); await a.waitSign();
+    a.disconnect(); await a.settle();
+    assert.equal(a.button('Save key backup').props.disabled, false);
+    await a.click('Connect owner wallet'); await a.click('Backpack');
+    a.rejectSign(); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.doesNotMatch(text(a.render()), /Late wallet rejection/);
+    assert.equal(a.button('Sign registration').props.disabled, false);
+    assert.equal(a.orders.length, 0);
+  } finally { globalThis.fetch = original; }
+});
+
+test('late connect cannot reconnect a stopped request or reset another action', async () => {
+  const original = globalThis.fetch;
+  try {
+    const a = fresh({ walletName: 'Backpack' }); a.holdConnect(); await a.click('Connect wallet');
+    a.button('Backpack').props.onClick();
+    await a.click('Stop waiting');
+    a.releaseConnect(); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(a.button('Connect wallet')); assert.equal(a.reads.length, 0); assert.equal(a.orders.length, 0);
+    await a.connect(); assert.ok(a.button('Create agent key'));
+  } finally { globalThis.fetch = original; }
+});
+
+test('latest backup retains the original registration after signing revoke and after encrypted restore', async () => {
+  const original = globalThis.fetch;
+  try {
+    const agents = [], a = fresh({ walletName: 'Backpack', agents }); await a.connect(); await a.child(); await a.click('Create agent key');
+    a.check('I saved my key'); await a.click('Sign registration'); await a.click('Save signed request backup');
+    const first = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+    a.check('I saved the updated backup'); await a.click('Submit registration');
+    agents.push(first.key.publicKey);
+    await a.click('Revoke access'); await a.click('Sign revoke request'); await a.click('Save signed request backup');
+    const latest = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+    assert.equal(latest.history.length, 1);
+    assert.deepEqual(latest.history[0], first.submission); assert.equal(latest.submission.operation, 'revoke');
+    await cryptoLib.validateSubmission(latest.key, latest.history[0]); await cryptoLib.validateSubmission(latest.key, latest.submission);
+    const encrypted = await vault.encryptVault(latest.key, 'disposable-test-passphrase', latest.submission, latest.history);
+    await a.click('Clear key from page'); a.check('I have an up-to-date backup'); await a.click('Clear key');
+    await a.click('Import saved key'); await a.click('Encrypted backup');
+    all(a.render()).find(n => n.type === 'Input' && n.props.type === 'password').props.onChange({ target: { value: 'disposable-test-passphrase' } });
+    all(a.render()).find(n => n.type === 'Input' && n.props.type === 'file').props.onChange({ target: { files: [new Blob([encrypted])] } });
+    all(a.render()).find(n => n.type === 'form' && all(n).some(x => x.type === 'Input' && x.props.type === 'file')).props.onSubmit({ preventDefault() {} }); await a.settle();
+    await a.click('Download latest backup');
+    const restored = await vault.decryptVault(await a.downloads.at(-1).text(), '', true);
+    assert.deepEqual(restored, latest);
+    assert.equal(a.signed.length, 2); assert.equal(a.orders.length, 1, 'import and backup must not submit old authorizations');
+  } finally { globalThis.fetch = original; }
+});
+
+test('key-only restore explains missing signed backup and has an explicit safe restart path', async () => {
+  const original = globalThis.fetch;
+  try {
+    const a = fresh({ walletName: 'Backpack' }); await a.connect(); await a.child(); await a.click('Create agent key');
+    assert.match(text(a.render()), /After signing, save the updated backup/);
+    await a.click('Save key backup'); const backup = await a.downloads.at(-1).text();
+    await a.click('Clear key from page'); a.check('I have an up-to-date backup'); await a.click('Clear key');
+    await a.click('Import saved key'); await a.click('JSON backup');
+    all(a.render()).find(n => n.type === 'Input' && n.props.type === 'file').props.onChange({ target: { files: [new Blob([backup])] } });
+    all(a.render()).find(n => n.type === 'form' && all(n).some(x => x.type === 'Input' && x.props.type === 'file')).props.onSubmit({ preventDefault() {} }); await a.settle();
+    assert.match(text(a.render()), /no signed registration request/);
+    await a.click('Connect owner wallet'); await a.click('Backpack'); await a.click('Check status');
+    await a.click('Clear key to start again');
+    assert.equal(a.button('Clear key').props.disabled, true);
+    a.check('I have an up-to-date backup'); await a.click('Clear key');
+    assert.equal(a.network().lockedReason, ''); assert.equal(a.orders.length, 0); assert.equal(a.signed.length, 0);
+  } finally { globalThis.fetch = original; }
+});
+
+
+test('a forged historical signature rejects the entire UI import before any connection or request', async () => {
+  const original = globalThis.fetch;
+  try {
+    const key = await cryptoLib.generateKey('testnet', child, owner);
+    const prepared = await cryptoLib.prepareRegistration(key, 'register');
+    let request;
+    try { request = await cryptoLib.finalizeRegistration(prepared, new Uint8Array(sign(null, prepared.messageBytes, pair.privateKey)), key); }
+    finally { prepared.free(); }
+    const current = { operation: 'register', request };
+    const history = [{ operation: 'register', request: { ...request, signature: bs58.encode(new Uint8Array(64)) } }];
+    const invalid = vault.exportBackup(key, current, history);
+    const a = fresh({ walletName: 'Backpack' }); await a.click('Import saved key'); await a.click('JSON backup');
+    all(a.render()).find(n => n.type === 'Input' && n.props.type === 'file').props.onChange({ target: { files: [new Blob([invalid])] } });
+    all(a.render()).find(n => n.type === 'form' && all(n).some(x => x.type === 'Input' && x.props.type === 'file')).props.onSubmit({ preventDefault() {} }); await a.settle();
+    assert.match(text(a.render()), /signature does not match/);
+    assert.equal(a.network().lockedReason, ''); assert.equal(a.orders.length, 0); assert.equal(a.signed.length, 0); assert.equal(a.reads.length, 0);
   } finally { globalThis.fetch = original; }
 });

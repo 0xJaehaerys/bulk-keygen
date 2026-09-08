@@ -19,7 +19,7 @@ export function signatureMode(value: unknown): SignatureMode {
   if (value === 'base58') return 'base58';
   throw new BulkError('Unsupported signing mode.');
 }
-export interface KeyBackup { key: AgentKey; submission: Submission | null }
+export interface KeyBackup { key: AgentKey; submission: Submission | null; history: Submission[] }
 export type RegistrationState = 'created' | 'signing' | 'signed' | 'submitting' | 'pending' | 'active' | 'rejected' | 'absent' | 'revoked';
 export class BulkError extends Error { code: string; constructor(message: string, code = 'BULK_ERROR') { super(message); this.name = 'BulkError'; this.code = code; } }
 export function record(v: unknown): Record<string, unknown> { if (!v || typeof v !== 'object' || Array.isArray(v)) throw new BulkError('BULK returned an unexpected response.'); return v as Record<string, unknown>; }
@@ -93,11 +93,11 @@ export function assertAgentAction(raw: unknown, agent: string, operation: AgentO
   const creation = record(action.agentWalletCreation);
   if (Object.keys(action).length !== 1 || Object.keys(creation).length !== 2 || creation.a !== agent || creation.d !== (operation === 'revoke')) throw new BulkError('The request does not match the selected key action.');
 }
-export function assertRegistrationEnvelope(raw: unknown, key: AgentKey, operation: AgentOperation = 'register'): Registration {
+export function assertRegistrationEnvelope(raw: unknown, key: Pick<AgentKey, 'account' | 'owner' | 'publicKey'>, operation: AgentOperation = 'register'): Registration {
   const tx = record(normalizeSdkValue(raw));
-  if (tx.account !== key.account || tx.signer !== key.owner || typeof tx.nonce !== 'string' || !/^\d+$/.test(tx.nonce) || BigInt(tx.nonce) > 18446744073709551615n || BigInt(tx.nonce) === 0n) throw new BulkError('The request does not match the selected account.');
+  if (tx.account !== key.account || tx.signer !== key.owner || typeof tx.nonce !== 'string' || !/^[1-9][0-9]{0,19}$/.test(tx.nonce) || BigInt(tx.nonce) > 18446744073709551615n || BigInt(tx.nonce) === 0n) throw new BulkError('The request does not match the selected account.');
   assertAgentAction(tx.actions, key.publicKey, operation);
-  if (typeof tx.signature !== 'string' || bs58.decode(tx.signature).length !== 64) throw new BulkError('Invalid wallet signature.');
+  if (typeof tx.signature !== 'string' || tx.signature.length > 88 || bs58.decode(tx.signature).length !== 64) throw new BulkError('Invalid wallet signature.');
   // Select the fields explicitly. No private key or SDK diagnostics can cross HTTP.
   return { actions: [{ agentWalletCreation: { a: key.publicKey, d: operation === 'revoke' } }], nonce: tx.nonce, account: key.account, signer: key.owner, signature: tx.signature };
 }

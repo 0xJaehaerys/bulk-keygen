@@ -49,7 +49,8 @@ function fresh() {
   const state = [], refs = [], orders = [], reads = [], selected = [];
   let stateIndex = 0, refIndex = 0, epoch = 0, currentOwner = owner, busy = false;
   let lastRun = Promise.resolve(), mode = 'timeout', signed = 0, downloads = 0;
-  let pendingOwner = '', release = null, childName = 'desk-1';
+  let pendingOwner = '', release = null, childName = 'desk-1', runningToken = 0;
+  let holdSignature = false, releaseSignature = null;
   const jsx = (type, props) => ({ type, props });
   const react = {
     useEffect() {},
@@ -65,6 +66,7 @@ function fresh() {
     get publicKey() { return currentOwner ? { toString: () => currentOwner } : null; },
     async signMessage(bytes) {
       signed++;
+      if (holdSignature) { holdSignature = false; await new Promise(resolve => { releaseSignature = resolve; }); }
       return { signature: new Uint8Array(sign(null, bytes, pair.privateKey)), publicKey: { toString: () => owner } };
     },
   };
@@ -76,10 +78,12 @@ function fresh() {
     },
     onPendingChange(value) { pendingOwner = value; },
     onVerified(address, info) { selected.push({ address, info }); },
+    onStopWaiting: stopWaiting,
     run(_label, task) {
       if (busy) return Promise.resolve();
       busy = true;
-      lastRun = task(epoch).finally(() => { busy = false; });
+      const token = ++runningToken;
+      lastRun = task(epoch).finally(() => { if (token === runningToken) busy = false; });
       return lastRun;
     },
   });
@@ -118,6 +122,7 @@ function fresh() {
     return success();
   };
   const render = () => { stateIndex = refIndex = 0; return exports.SubaccountCreator(props()); };
+  function stopWaiting() { epoch++; runningToken++; busy = false; render(); }
   const button = label => {
     const found = all(render()).find(node => node.type === 'button' && text(node.props.children).trim() === label);
     assert.ok(found, `Button not found: ${label}`); return found;
@@ -126,12 +131,18 @@ function fresh() {
     state, refs, orders, reads, selected, render, button,
     get signed() { return signed; }, get downloads() { return downloads; }, get pendingOwner() { return pendingOwner; },
     checkbox() { return all(render()).find(node => node.type === 'Checkbox'); },
-    async sign() {
-      all(render()).find(node => node.type === 'Input' && node.props.pattern).props.onChange({ target: { value: 'desk-1' } });
+    async sign(name = 'desk-1') {
+      all(render()).find(node => node.type === 'Input' && node.props.pattern).props.onChange({ target: { value: name } });
       all(render()).find(node => node.type === 'form').props.onSubmit({ preventDefault() {} });
       await lastRun; assert.equal(state[3], 'signed');
     },
     async settle() { await lastRun; },
+    captureRun() { return lastRun; },
+    stopWaiting,
+    holdSignature() { holdSignature = true; },
+    async waitSignature() { for (let i = 0; i < 100 && !releaseSignature; i++) await new Promise(setImmediate); assert.ok(releaseSignature); },
+    releaseSignature() { releaseSignature(); },
+    acknowledgeClose() { const label = all(render()).find(node => node.type === 'label' && text(node).includes('I saved the latest creation request')); assert.ok(label); all(label).find(node => node.type === 'Checkbox').props.onCheckedChange(true); },
     mode(value) { mode = value; },
     disconnect() { currentOwner = ''; epoch++; render(); },
     reconnect() { currentOwner = owner; epoch++; render(); },
@@ -215,4 +226,65 @@ checks.push('Wallet change during async pre-submit crypto validation prevents di
 
 assert.equal(checks.length, 9);
 } finally { globalThis.fetch = originalFetch; }
+});
+
+
+await test('closing a saved creation request releases the page without cancelling or sending it', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const a = fresh(); await a.sign();
+    const originalRequest = { ...a.state[2] };
+    const close = a.button('Close request from page');
+    assert.equal(close.props.disabled, true);
+    close.props.onClick(); assert.equal(a.pendingOwner, owner, 'the handler also requires acknowledgement');
+    a.button('Close').props.onClick(); assert.equal(a.pendingOwner, owner, 'ordinary Close only hides the dialog');
+    a.button('Save creation request').props.onClick();
+    assert.equal(a.button('Close request from page').props.disabled, true, 'download dispatch does not acknowledge saving');
+    a.acknowledgeClose(); a.button('Close request from page').props.onClick();
+    assert.equal(a.pendingOwner, ''); assert.equal(a.state[2], null); assert.equal(a.state[3], 'form');
+    assert.equal(a.state[1], ''); assert.equal(a.state[5], '');
+    assert.equal(a.orders.length, 0); assert.equal(a.signed, 1);
+    await a.restore(originalRequest);
+    assert.equal(a.state[3], 'pending'); assert.equal(a.pendingOwner, owner);
+    assert.equal(a.state[2].request.signature, originalRequest.request.signature);
+    assert.equal(a.orders.length, 0); assert.equal(a.signed, 1);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('late creation receipt and stale controls cannot overwrite a closed or replacement request', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const a = fresh(); await a.sign(); a.checkbox().props.onCheckedChange(true); a.mode('delayed');
+    a.button('Create subaccount').props.onClick(); await a.waitOrder();
+    const delayedRun = a.captureRun();
+    a.stopWaiting(); a.acknowledgeClose();
+    const staleClose = a.button('Close request from page');
+    const staleRetry = a.button('Retry original request');
+    staleClose.props.onClick(); assert.equal(a.pendingOwner, '');
+    await a.sign('desk-2'); const replacement = a.state[2]; const notice = a.state[7];
+    staleClose.props.onClick(); staleRetry.props.onClick();
+    assert.equal(a.state[2], replacement); assert.equal(a.orders.length, 1);
+    a.release(); await delayedRun;
+    assert.equal(a.state[2], replacement); assert.equal(a.state[2].address, null);
+    assert.equal(a.state[3], 'signed'); assert.equal(a.pendingOwner, owner);
+    assert.equal(a.state[6], ''); assert.equal(a.state[7], notice); assert.equal(a.selected.length, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('late signature after Stop waiting cannot restore a discarded operation or alter a new request', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const a = fresh(); a.holdSignature();
+    const delayedSign = a.sign(); await a.waitSignature();
+    const stop = a.button('Stop waiting');
+    assert.notEqual(stop.props.disabled, true, 'the modal must expose cancellation while other controls are disabled');
+    stop.props.onClick();
+    assert.equal(a.state[2], null); assert.equal(a.signed, 1); assert.equal(a.orders.length, 0);
+    await a.sign('desk-2');
+    const replacement = a.state[2], notice = a.state[7];
+    a.releaseSignature(); await delayedSign;
+    assert.equal(a.state[2], replacement); assert.equal(a.state[2].name, 'desk-2');
+    assert.equal(a.state[6], ''); assert.equal(a.state[7], notice);
+    assert.equal(a.orders.length, 0); assert.equal(a.selected.length, 0); assert.equal(a.pendingOwner, owner);
+  } finally { globalThis.fetch = originalFetch; }
 });

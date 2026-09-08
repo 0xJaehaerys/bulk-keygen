@@ -122,7 +122,7 @@ test('envelope rejects unrelated actions, agents, signers and unsafe number nonc
   const { raw } = signed();
   for (const tx of [
     { ...raw, signer: child }, { ...raw, account: child }, { ...raw, nonce: Number(raw.nonce) },
-    { ...raw, nonce: '18446744073709551616' },
+    ...['0', '01', ' 1', '+1', '1.0', '1e3', '18446744073709551616', '0'.repeat(24000) + '1'].map(nonce => ({ ...raw, nonce })),
     { ...raw, actions: [...raw.actions, { cancelAll: {} }] },
     { ...raw, actions: [{ agentWalletCreation: { a: child, d: false } }] },
     { ...raw, actions: [{ agentWalletCreation: { a: key.publicKey, d: true } }] },

@@ -20,3 +20,13 @@ node scripts/keygen.mjs generate --owner YOUR_PUBLIC_WALLET_ADDRESS --network te
 ```
 
 For a subaccount, add `--account YOUR_SUBACCOUNT_PUBLIC_ADDRESS`. Generation works offline and does not register the key. Use the CLI help for explicit signing, submission and recovery commands. Keep key files private and use the latest backup; do not replay an old registration after revoking access.
+
+## Restore and recover
+
+New backups use version 2 JSON internally, with the current signed request and signature history. Older plain JSON and encrypted version 1 backups remain supported. History preserves signatures; it does not cancel them or replay them automatically.
+
+After a timeout, load the latest signed backup and retry only its current, unchanged request. A key-only backup cannot recover a lost signing request, and importing it does not automatically authorize a new one. Never replay a historical registration after revoking access.
+
+**Stop waiting** only stops the local wait. A wallet request may still complete, and a submitted action may still take effect. Closing a subaccount-creation request closes it locally; restore its saved creation-request file to continue.
+
+For subaccounts, CLI `direct_*` statuses describe the selected account's own agent membership. Read `account`, `directMembership`, `inheritedMembership` and `effectiveAccess` together; `null` means unknown. `direct_revoked` does not rule out access inherited from the parent account.

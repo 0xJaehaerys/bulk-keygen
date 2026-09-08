@@ -20,6 +20,7 @@ interface Props {
   ensureContext: (version: number, owner?: string) => void;
   onPendingChange: (owner: string) => void;
   onVerified: (address: string, info: FullAccount) => void;
+  onStopWaiting?: () => void;
 }
 export function SubaccountCreator(props: Props) {
   const [open, setOpen] = useState(false);
@@ -30,11 +31,17 @@ export function SubaccountCreator(props: Props) {
   const [address, setAddress] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [closeSaved, setCloseSaved] = useState(false);
   const attemptRef = useRef<SubaccountRequest | null>(null);
   const phaseRef = useRef<Phase>('form');
   const receiptTrusted = useRef(false);
+  const revision = useRef(0);
+  const closeSavedFor = useRef<SubaccountRequest | null>(null);
+  const latestProps = useRef(props);
+  latestProps.current = props;
   function update(value: SubaccountRequest | null, next: Phase) {
     attemptRef.current = value; phaseRef.current = next; setAttemptState(value); setPhase(next);
+    closeSavedFor.current = null; setCloseSaved(false);
     props.onPendingChange(value && next !== 'confirmed' ? value.owner : '');
   }
   useEffect(() => {
@@ -42,34 +49,49 @@ export function SubaccountCreator(props: Props) {
       if (attemptRef.current && phaseRef.current !== 'confirmed') { event.preventDefault(); event.returnValue = ''; }
     };
     window.addEventListener('beforeunload', preventLoss);
-    return () => window.removeEventListener('beforeunload', preventLoss);
+    return () => { revision.current++; window.removeEventListener('beforeunload', preventLoss); };
   }, []);
-  function execute(label: string, task: (version: number) => Promise<void>) {
+  function execute(label: string, task: (version: number, localRevision: number) => Promise<void>) {
+    if (latestProps.current.busy) return;
+    const localRevision = revision.current;
     setError(''); setNotice('');
     void props.run(label, async version => {
-      try { await task(version); } catch (e) { setError(friendlyError(e)); }
+      try { await task(version, localRevision); } catch (e) {
+        if (localRevision !== revision.current) return;
+        try { props.ensureContext(version); } catch { return; }
+        setError(friendlyError(e));
+      }
     });
   }
-  function checkContext(version: number, value?: SubaccountRequest) {
+  function checkContext(version: number, localRevision: number, value?: SubaccountRequest) {
     props.ensureContext(version, value?.owner ?? props.owner);
-    if (props.hasKey || (value && (value.network !== props.network || attemptRef.current?.request !== value.request))) throw new BulkError('Account context changed. Keep the saved request.');
+    if (localRevision !== revision.current || latestProps.current.hasKey || (value && (value.network !== latestProps.current.network || attemptRef.current?.request !== value.request))) throw new BulkError('Account context changed. Keep the saved request.');
+  }
+  function resetRequest() {
+    revision.current++;
+    update(null, 'form'); receiptTrusted.current = false;
+    setName(''); setAddress(''); setSaved(false); setError(''); setNotice(''); setOpen(false);
+  }
+  function closeRequest() {
+    if (latestProps.current.busy || !attempt || attemptRef.current !== attempt || closeSavedFor.current !== attempt || !['signed', 'pending'].includes(phaseRef.current)) return;
+    resetRequest();
   }
   function signCreation() {
     if (attemptRef.current || props.hasKey || !props.owner) return;
-    execute('Preparing subaccount…', async version => {
+    execute('Preparing subaccount…', async (version, localRevision) => {
       let prepared: Awaited<ReturnType<typeof prepareSubaccount>> | undefined;
       let step: AuthorizationStep = 'account';
       try {
         if (isPhantomWallet(props.wallet()?.name ?? '')) throw new BulkError('Phantom cannot create subaccounts here. Use Backpack with the same owner address. Phantom supports main-account agent keys only.');
         const selectedName = subaccountName(name.trim());
-        checkContext(version);
+        checkContext(version, localRevision);
         const master = await readAccount(props.network, props.owner);
-        checkContext(version); assertOwner(master, props.owner, props.owner);
+        checkContext(version, localRevision); assertOwner(master, props.owner, props.owner);
         if (master.subAccounts && master.subAccounts.length >= 64) throw new BulkError('BULK allows up to 64 subaccounts per main account.');
-        step = 'prepare'; prepared = await prepareSubaccount(props.network, props.owner, selectedName); checkContext(version);
-        step = 'wallet'; const signed = await signWithWallet(props.wallet()!, prepared.messageBytes); checkContext(version);
+        step = 'prepare'; prepared = await prepareSubaccount(props.network, props.owner, selectedName); checkContext(version, localRevision);
+        step = 'wallet'; const signed = await signWithWallet(props.wallet()!, prepared.messageBytes); checkContext(version, localRevision);
         if (signed.publicKey && signed.publicKey.toString() !== props.owner) throw new BulkError('A different wallet signed the request.');
-        step = 'verify'; const request = await finalizeSubaccount(prepared, new Uint8Array(signed.signature), props.owner, selectedName); checkContext(version);
+        step = 'verify'; const request = await finalizeSubaccount(prepared, new Uint8Array(signed.signature), props.owner, selectedName); checkContext(version, localRevision);
         update({ format: 'bulk-subaccount-request-v1', network: props.network, owner: props.owner, name: selectedName, request, address: null }, 'signed');
         setSaved(false); setNotice('Signed, not sent. Save the request before creating your subaccount.');
       } catch (e) {
@@ -85,48 +107,48 @@ export function SubaccountCreator(props: Props) {
     const link = document.createElement('a'); link.href = url; link.download = `bulk-${value.network}-create-${value.name}.json`; link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  async function resolveAddress(value: SubaccountRequest, target: string, version: number) {
-    checkContext(version, value);
-    const info = await verifySubaccount(value, target, undefined, !receiptTrusted.current); checkContext(version, value);
+  async function resolveAddress(value: SubaccountRequest, target: string, version: number, localRevision: number) {
+    checkContext(version, localRevision, value);
+    const info = await verifySubaccount(value, target, undefined, !receiptTrusted.current); checkContext(version, localRevision, value);
     const resolved = { ...value, address: target };
     update(resolved, 'confirmed'); setAddress(target); props.onVerified(target, info);
     setNotice('Subaccount verified and selected. You can now create its agent key.');
   }
   function submit() {
     const value = attemptRef.current;
-    if (!value || !saved || !['signed', 'pending'].includes(phaseRef.current)) return;
-    execute('Creating subaccount…', async version => {
-      checkContext(version, value);
-      const master = await readAccount(value.network, value.owner); checkContext(version, value); assertOwner(master, value.owner, value.owner);
+    if (!value || value !== attempt || !saved || !['signed', 'pending'].includes(phaseRef.current)) return;
+    execute('Creating subaccount…', async (version, localRevision) => {
+      checkContext(version, localRevision, value);
+      const master = await readAccount(value.network, value.owner); checkContext(version, localRevision, value); assertOwner(master, value.owner, value.owner);
       // An address already known for this attempt needs readback, not another write.
-      if (receiptTrusted.current && value.address) { await resolveAddress(value, value.address, version); return; }
+      if (receiptTrusted.current && value.address) { await resolveAddress(value, value.address, version, localRevision); return; }
       update(value, 'pending');
       let returnedAddress: string | null = null;
-      try { returnedAddress = await submitSubaccount(value, undefined, () => checkContext(version, value)); } catch { /* Transport failures never prove rejection. */ }
+      try { returnedAddress = await submitSubaccount(value, undefined, () => checkContext(version, localRevision, value)); } catch { /* Transport failures never prove rejection. */ }
       let retained = value;
-      if (returnedAddress && attemptRef.current?.request === value.request) {
-        // Preserve the only returned address even if a wallet change invalidated the UI.
+      if (returnedAddress && localRevision === revision.current && attemptRef.current?.request === value.request) {
+        // Keep a receipt after disconnect only while this exact request remains on the page.
         retained = { ...value, address: returnedAddress }; receiptTrusted.current = true; update(retained, 'pending'); setAddress(returnedAddress);
       }
-      checkContext(version, retained);
-      if (retained.address) await resolveAddress(retained, retained.address, version);
+      checkContext(version, localRevision, retained);
+      if (retained.address) await resolveAddress(retained, retained.address, version, localRevision);
       else setNotice('Creation is unconfirmed. Keep this request. Check BULK or retry this same request; do not sign a replacement.');
     });
   }
   function checkStatus() {
     const value = attemptRef.current;
-    if (!value) return;
-    execute('Checking subaccount…', async version => {
+    if (!value || value !== attempt) return;
+    execute('Checking subaccount…', async (version, localRevision) => {
       const target = receiptTrusted.current && value.address ? value.address : address.trim();
       if (!target) throw new BulkError('Paste the subaccount public address from BULK to check it.');
-      await resolveAddress(value, target, version);
+      await resolveAddress(value, target, version, localRevision);
     });
   }
   function restore(file: File | undefined) {
     if (!file || attemptRef.current || props.hasKey) return;
-    execute('Opening creation request…', async version => {
+    execute('Opening creation request…', async (version, localRevision) => {
       if (file.size > 8192) throw new BulkError('Creation request file too large. Maximum size: 8 KB.');
-      const restored = await importSubaccountRequest(await file.text()); checkContext(version);
+      const restored = await importSubaccountRequest(await file.text()); checkContext(version, localRevision);
       if (restored.network !== props.network) throw new BulkError(`Select ${NETWORKS[restored.network].label} before opening this request.`);
       if (restored.owner !== props.owner) throw new BulkError('Connect the main wallet that signed this request.');
       receiptTrusted.current = false; update(restored, 'pending'); setSaved(true); setAddress(restored.address ?? '');
@@ -160,11 +182,16 @@ export function SubaccountCreator(props: Props) {
             {phase === 'pending' && <button className="btn full" disabled={props.busy || !ready} onClick={checkStatus}><RefreshCw size={16}/> Check subaccount</button>}
             {phase !== 'confirmed' && !receiptTrusted.current && <button className="btn primary full" disabled={props.busy || !ready || !saved} onClick={submit}>{phase === 'signed' ? 'Create subaccount' : 'Retry original request'}</button>}
             {!ready && phase !== 'confirmed' && <p className="hint">Reconnect the owner wallet to continue. Your request is still here.</p>}
-            {phase === 'confirmed' && <button className="btn primary full" disabled={props.busy} onClick={() => { update(null, 'form'); receiptTrusted.current = false; setName(''); setAddress(''); setSaved(false); setOpen(false); }}>Continue to agent key</button>}
+            {phase === 'confirmed' && <button className="btn primary full" disabled={props.busy} onClick={() => { if (!latestProps.current.busy && attemptRef.current === attempt && phaseRef.current === 'confirmed') resetRequest(); }}>Continue to agent key</button>}
+            {(phase === 'signed' || phase === 'pending') && <details className="guide-details"><summary>Close this request from the page</summary><div className="stack guide-detail-body">
+              <p className="hint">Save the latest creation request first. Closing it here does not cancel its signature or a submitted request. Restore the file to check status or retry the same request; do not sign a replacement.</p>
+              <label className="checkrow"><Checkbox checked={closeSaved} disabled={props.busy} onCheckedChange={value => { if (latestProps.current.busy || attemptRef.current !== attempt) return; closeSavedFor.current = value === true ? attempt : null; setCloseSaved(value === true); }}/><span>I saved the latest creation request and can restore it.</span></label>
+              <button className="btn full" disabled={props.busy || !closeSaved} onClick={closeRequest}>Close request from page</button>
+            </div></details>}
           </>}
           {notice && <p role="status" className="message">{notice}</p>}
           {error && <p role="alert" className="message error">{error}</p>}
-          {props.busy && <p role="status" className="hint">Complete any open wallet request, then wait for BULK.</p>}
+          {props.busy && <><p role="status" className="hint">Complete any open wallet request, then wait for BULK.</p>{props.onStopWaiting && <><button className="btn full" type="button" onClick={props.onStopWaiting}>Stop waiting</button><p className="hint">Stopping the wait does not cancel a signed or submitted request.</p></>}</>}
           <button className="btn text full" disabled={props.busy} onClick={() => setOpen(false)}>Close</button>
         </div>
       </DialogContent>

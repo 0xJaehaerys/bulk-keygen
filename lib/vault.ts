@@ -3,6 +3,9 @@ import { BulkError, NETWORKS, assertRegistrationEnvelope, exportKey, publicKeyBy
 import type { AgentKey, KeyBackup, Submission } from './bulk.ts';
 
 export const MAX_VAULT_BYTES = 32768;
+export const MAX_BACKUP_PLAINTEXT_BYTES = 16368;
+export const MAX_SUBMISSION_HISTORY = 16;
+const MAX_CIPHERTEXT_BYTES = MAX_BACKUP_PLAINTEXT_BYTES + 16;
 export const VAULT_ITERATIONS = 600000;
 const FORMAT = 'bulk-agent-vault-v1';
 const encoder = new TextEncoder();
@@ -49,43 +52,82 @@ export function parseKeyExport(value: unknown): AgentKey {
   if (typeof v.created_at !== 'string' || v.created_at.length > 40 || !Number.isFinite(Date.parse(v.created_at))) throw new BulkError('Invalid key creation date.');
   return { network: v.network, account: v.account_public_key as string, owner: v.owner_public_key as string, publicKey: v.agent_public_key as string, secretKey: v.agent_private_key_base58, createdAt: v.created_at };
 }
-export function exportBackup(key: AgentKey, submission: Submission | null = null): string {
-  return JSON.stringify({ format: 'bulk-agent-backup-v1', key: JSON.parse(exportKey(key)), submission }, null, 2);
+type SubmissionBinding = Pick<AgentKey, 'account' | 'owner' | 'publicKey'>;
+function submissionBinding(value: unknown): SubmissionBinding {
+  const s = record(value), tx = record(s.request);
+  if (!Array.isArray(tx.actions) || tx.actions.length !== 1) throw new BulkError('Only one agent action is allowed.');
+  const agent = record(record(tx.actions[0]).agentWalletCreation).a;
+  for (const address of [tx.account, tx.signer, agent]) {
+    if (typeof address !== 'string' || address.length > 44) throw new BulkError('Invalid public address in request history.');
+    publicKeyBytes(address);
+  }
+  return { account: tx.account as string, owner: tx.signer as string, publicKey: agent as string };
+}
+function parseSubmission(value: unknown, key: SubmissionBinding): Submission {
+  const s = record(value); exact(s, ['operation', 'request', ...('signatureMode' in s ? ['signatureMode'] : [])]);
+  if (s.operation !== 'register' && s.operation !== 'revoke') throw new BulkError('Invalid action in the backup.');
+  const mode = signatureMode(s.signatureMode);
+  if (mode === 'base58' && key.account !== key.owner) throw new BulkError('Text signing is only supported for the main account.');
+  return { operation: s.operation, request: assertRegistrationEnvelope(s.request, key, s.operation), ...('signatureMode' in s ? { signatureMode: mode } : {}) };
+}
+function parseHistory(value: unknown, key?: SubmissionBinding): Submission[] {
+  if (!Array.isArray(value) || value.length > MAX_SUBMISSION_HISTORY) throw new BulkError(`Request history must contain at most ${MAX_SUBMISSION_HISTORY} entries. Keep the existing backup; no requests were discarded.`);
+  let binding = key;
+  return value.map(entry => {
+    binding ??= submissionBinding(entry);
+    return parseSubmission(entry, binding);
+  });
+}
+function requestIdentity(value: Submission): string {
+  return JSON.stringify({ operation: value.operation, request: value.request, signatureMode: signatureMode(value.signatureMode) });
+}
+// Call before preparing another signature. A full history must never evict an
+// earlier authorization whose outcome may still be uncertain.
+export function appendSubmissionHistory(history: Submission[], previous: Submission | null): Submission[] {
+  const result = parseHistory(history);
+  if (previous === null) return result;
+  const entry = parseSubmission(previous, submissionBinding(result[0] ?? previous));
+  if (result.some(saved => requestIdentity(saved) === requestIdentity(entry))) return result;
+  if (result.length === MAX_SUBMISSION_HISTORY) throw new BulkError(`Request history is full (${MAX_SUBMISSION_HISTORY} entries). Keep the existing backup; no requests were discarded.`);
+  return [...result, entry];
 }
 function parseBackup(backup: Record<string, unknown>): KeyBackup {
-  exact(backup, ['format', 'key', 'submission']);
-  if (backup.format !== 'bulk-agent-backup-v1') throw new BulkError('Unsupported backup version.');
+  if (backup.format !== 'bulk-agent-backup-v1' && backup.format !== 'bulk-agent-backup-v2') throw new BulkError('Unsupported backup version.');
+  exact(backup, ['format', 'key', 'submission', ...(backup.format === 'bulk-agent-backup-v2' ? ['history'] : [])]);
   const key = parseKeyExport(backup.key);
-  let submission: Submission | null = null;
-  if (backup.submission !== null) {
-    const s = record(backup.submission); exact(s, ['operation', 'request', ...('signatureMode' in s ? ['signatureMode'] : [])]);
-    if (s.operation !== 'register' && s.operation !== 'revoke') throw new BulkError('Invalid action in the backup.');
-    const mode = signatureMode(s.signatureMode);
-    if (mode === 'base58' && key.account !== key.owner) throw new BulkError('Text signing is only supported for the main account.');
-    submission = { operation: s.operation, request: assertRegistrationEnvelope(s.request, key, s.operation), ...('signatureMode' in s ? { signatureMode: mode } : {}) };
-  }
-  return { key, submission };
+  const submission = backup.submission === null ? null : parseSubmission(backup.submission, key);
+  const history = backup.format === 'bulk-agent-backup-v2' ? parseHistory(backup.history, key) : [];
+  return { key, submission, history };
 }
-export async function encryptVault(key: AgentKey, password: string, submission: Submission | null = null): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encryptionKey = await derive(password, salt);
-  const plaintext = encoder.encode(exportBackup(key, submission));
+export function exportBackup(key: AgentKey, submission: Submission | null = null, history: Submission[] = []): string {
+  const parsed = parseBackup({ format: 'bulk-agent-backup-v2', key: JSON.parse(exportKey(key)), submission, history });
+  const text = JSON.stringify({ format: 'bulk-agent-backup-v2', key: JSON.parse(exportKey(parsed.key)), submission: parsed.submission, history: parsed.history }, null, 2);
+  if (encoder.encode(text).length > MAX_BACKUP_PLAINTEXT_BYTES) throw new BulkError('Backup is too large to restore. Keep the existing backup; no requests were discarded.');
+  return text;
+}
+export async function encryptVault(key: AgentKey, password: string, submission: Submission | null = null, history: Submission[] = []): Promise<string> {
+  // Validate the complete restoreable payload before KDF work or encryption.
+  const plaintext = encoder.encode(exportBackup(key, submission, history));
   try {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encryptionKey = await derive(password, salt);
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, encryptionKey, plaintext);
-    return JSON.stringify({ format: FORMAT, kdf: 'PBKDF2-SHA256', iterations: VAULT_ITERATIONS, cipher: 'AES-256-GCM', salt: toBase64(salt), iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) }, null, 2);
+    const text = JSON.stringify({ format: FORMAT, kdf: 'PBKDF2-SHA256', iterations: VAULT_ITERATIONS, cipher: 'AES-256-GCM', salt: toBase64(salt), iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) }, null, 2);
+    if (encoder.encode(text).length > MAX_VAULT_BYTES) throw new BulkError('Encrypted backup is too large to restore. Keep the existing backup.');
+    return text;
   } finally { plaintext.fill(0); }
 }
 export async function decryptVault(text: string, password: string, allowPlaintext = false): Promise<KeyBackup> {
   const v = parse(text);
-  if (v.format === 'bulk-agent-key-v1' || v.format === 'bulk-agent-backup-v1') {
+  if (v.format === 'bulk-agent-key-v1' || v.format === 'bulk-agent-backup-v1' || v.format === 'bulk-agent-backup-v2') {
     if (!allowPlaintext) throw new BulkError('This file is unencrypted. Enable plaintext import to continue.');
-    return v.format === 'bulk-agent-key-v1' ? { key: parseKeyExport(v), submission: null } : parseBackup(v);
+    return v.format === 'bulk-agent-key-v1' ? { key: parseKeyExport(v), submission: null, history: [] } : parseBackup(v);
   }
   exact(v, ['format', 'kdf', 'iterations', 'cipher', 'salt', 'iv', 'ciphertext']);
   if (v.format !== FORMAT || v.kdf !== 'PBKDF2-SHA256' || v.iterations !== VAULT_ITERATIONS || v.cipher !== 'AES-256-GCM') throw new BulkError('Unsupported encrypted file version.');
   const salt = fromBase64(v.salt, 16), iv = fromBase64(v.iv, 12), ciphertext = fromBase64(v.ciphertext);
-  if (ciphertext.length < 17 || ciphertext.length > 16384) throw new BulkError('Invalid encrypted file.');
+  if (ciphertext.length < 17 || ciphertext.length > MAX_CIPHERTEXT_BYTES) throw new BulkError('Invalid encrypted file.');
   const encryptionKey = await derive(password, salt);
   let plaintext: ArrayBuffer;
   try { plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, encryptionKey, ciphertext); }

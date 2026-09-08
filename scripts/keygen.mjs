@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { createPrivateKey, createPublicKey, sign, randomUUID } from 'node:crypto';
 import init, { WasmKeypair, prepareAgentWallet } from 'bulk-keychain-wasm';
 import bs58 from 'bs58';
-import { BulkError, NETWORKS, publicKeyBytes, assertOwner, assertAgentAction, readAccount, readbackState, submitRegistration } from '../lib/bulk.ts';
-import { decryptVault, exportBackup, MAX_VAULT_BYTES } from '../lib/vault.ts';
+import { BulkError, NETWORKS, publicKeyBytes, assertOwner, assertAgentAction, readAccount, readbackState, agentMembership, submitRegistration } from '../lib/bulk.ts';
+import { decryptVault, exportBackup, appendSubmissionHistory, MAX_VAULT_BYTES } from '../lib/vault.ts';
 import { finalizeRegistration } from '../lib/crypto.ts';
 
 let initialized;
@@ -56,6 +56,7 @@ async function loadBackup(path) {
     if (pair.pubkey !== backup.key.publicKey || pair.toBase58() !== backup.key.secretKey) throw new BulkError('Agent keypair does not match its public key.');
   } finally { pair.free(); bytes.fill(0); }
   if (backup.submission) await verifyRequest(backup);
+  for (const submission of backup.history) await verifyRequest({ key: backup.key, submission });
   return { backup, original };
 }
 async function prepare(key, operation, nonce) {
@@ -91,6 +92,27 @@ async function ownerSigner(path, expectedOwner) {
   } finally { bytes.fill(0); }
 }
 
+// Direct removal on a child does not remove an agent inherited from its owner.
+// Missing or unverified parent data must never be interpreted as no inherited access.
+async function accessSummary(key, info, intent, fetcher) {
+  const child = key.account !== key.owner;
+  const directMembership = info ? agentMembership(info, key.publicKey) : null;
+  let inheritedMembership = child ? null : false;
+  if (child) {
+    try {
+      const parent = await readAccount(key.network, key.owner, fetcher);
+      assertOwner(parent, key.owner, key.owner);
+      inheritedMembership = agentMembership(parent, key.publicKey);
+    } catch { /* Parent access is unknown until an owner-verified read succeeds. */ }
+  }
+  const effectiveAccess = directMembership === true || inheritedMembership === true ? true
+    : directMembership === false && inheritedMembership === false ? false : null;
+  const directStatus = info ? readbackState(info, key.publicKey, intent) : 'pending';
+  return { network: key.network, account: key.account, owner: key.owner, agentPublicKey: key.publicKey,
+    status: child ? `direct_${directStatus}` : directStatus, directStatus,
+    directMembership, inheritedMembership, effectiveAccess };
+}
+
 const usage = `BULK local keygen · Node.js 24+
 
 Offline generation (no browser, wallet secret, or network request):
@@ -106,7 +128,9 @@ Online, explicit submission of the saved request (one attempt only):
   npm run keygen -- submit --file ./keys/agent.json --confirm-network testnet
   npm run keygen -- status --file ./keys/agent.json
 
-Only file paths are accepted for secrets. Key files must have permissions 600.
+Only file paths are accepted for secrets. Key files must have permissions 600 on POSIX systems.
+Child status describes direct membership only; effectiveAccess also checks the owner account.
+Earlier signed requests are retained for recovery, not automatically replayed or cancelled.
 Use a local owner keypair only if you already manage one. Phantom cannot sign from this CLI.
 Keep the latest agent file: a copy made before signing has no request to retry.
 `;
@@ -151,12 +175,14 @@ export async function runCli(args, { fetcher = fetch, output = text => process.s
   const { key } = backup;
   if (command.startsWith('sign-')) {
     const operation = command === 'sign-register' ? 'register' : 'revoke';
-    if (operation === 'register' && backup.submission) throw new BulkError('A request already exists. Submit that exact request or sign a revoke; do not create another registration.');
+    if (operation === 'register' && (backup.submission || backup.history.length)) throw new BulkError('A request already exists. Submit that exact request or sign a revoke; do not create another registration.');
+    // Check the history bound before opening the owner key or creating a signature.
+    const history = appendSubmissionHistory(backup.history, backup.submission);
     const signer = await ownerSigner(required('owner-keypair'), key.owner);
     const prepared = await prepare(key, operation);
     try {
       const request = await finalizeRegistration(prepared, new Uint8Array(sign(null, prepared.messageBytes, signer)), key, operation);
-      await updateBackup(path, original, exportBackup(key, { operation, request }));
+      await updateBackup(path, original, exportBackup(key, { operation, request }, history));
       output(JSON.stringify({ network: key.network, account: key.account, agentPublicKey: key.publicKey, operation, state: 'signed_not_submitted', saved: resolve(path) }));
     } finally { prepared.free(); }
     return;
@@ -168,18 +194,20 @@ export async function runCli(args, { fetcher = fetch, output = text => process.s
   const info = await readAccount(key.network, key.account, fetcher);
   assertOwner(info, key.account, key.owner);
   if (command === 'status') {
-    output(JSON.stringify({ network: key.network, agentPublicKey: key.publicKey, status: readbackState(info, key.publicKey, backup.submission?.operation ?? null) })); return;
+    output(JSON.stringify(await accessSummary(key, info, backup.submission?.operation ?? null, fetcher))); return;
   }
   const current = readbackState(info, key.publicKey, backup.submission.operation);
-  if (current === 'active' || current === 'revoked') { output(JSON.stringify({ status: current, sent: false })); return; }
+  if (current === 'active' || current === 'revoked') {
+    output(JSON.stringify({ ...await accessSummary(key, info, backup.submission.operation, fetcher), sent: false })); return;
+  }
   let result = 'unknown';
   try { result = await submitRegistration(key.network, backup.submission.request, fetcher); } catch { /* Preserve request for explicit retry. */ }
-  let status = 'pending';
+  let fresh = null;
   try {
-    const fresh = await readAccount(key.network, key.account, fetcher); assertOwner(fresh, key.account, key.owner);
-    status = readbackState(fresh, key.publicKey, backup.submission.operation);
+    const observed = await readAccount(key.network, key.account, fetcher); assertOwner(observed, key.account, key.owner);
+    fresh = observed;
   } catch { /* Transport failure never proves rejection or absence. */ }
-  output(JSON.stringify({ network: key.network, requestResult: result, status, sent: true, recoveryFile: resolve(path) }));
+  output(JSON.stringify({ ...await accessSummary(key, fresh, backup.submission.operation, fetcher), requestResult: result, sent: true, recoveryFile: resolve(path) }));
   } finally { await lockFile.close(); await unlink(lock); }
 }
 
