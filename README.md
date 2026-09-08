@@ -2,7 +2,7 @@
 
 Generate, register and revoke BULK agent keys with a Solana wallet.
 
-[Open app](https://bulk-keygen-production.up.railway.app)
+[Open app](https://bulk-keygen.up.railway.app)
 
 ## Run locally
 
